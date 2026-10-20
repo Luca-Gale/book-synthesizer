@@ -87,6 +87,9 @@ tags:
 - Walk through every mathematical formulation, model structure, or proof in the section without skipping algebraic or conceptual steps.
 - If the section contains sub-subsections (`<X.Y.1>`, `<X.Y.2>`), give each its own `### <X.Y.1> <Sub-title>` heading.
 - Explicitly highlight every **assumption** (e.g., linearity, time-invariance, zero-mean white noise, invertibility) required for the equations to hold.
+- **Inline Visual Walkthroughs & Cropped Diagrams**:
+  - **CRITICAL**: Never isolate figures at the end of the note. Embed every cropped textbook figure (`![[assets/fig_<X>_<Y>_<slug>.png]]`) **directly inline within the exact subsection or paragraph** where that physical system, block diagram, signal plot, or derivation is introduced.
+  - Immediately beneath each embedded figure, include a concise **How to Read This Diagram** walkthrough explaining the axes, blocks, signal flows, or geometry and how they map to the surrounding equations.
 - **Strict Obsidian MathJax & Whitespace Discipline**:
   - Format inline math as `$inline$` (no spaces immediately inside the `$` delimiters).
   - **CRITICAL**: Always ensure there is a space BEFORE the opening `$` and AFTER the closing `$` when adjacent to surrounding words, parentheses, or markdown bold/italic formatting (e.g. write `at time $t$ for all $t \ge 0$`, NEVER `at time$t$for all$t \ge 0$`). Do not let `$` touch adjacent letters or words. Trailing sentence punctuation (`$x$,` or `$x$.`) is allowed without a space.
@@ -94,14 +97,7 @@ tags:
 
 ---
 
-## 3. Visual Walkthrough & Diagrams
-*(Include if the section contains figures; otherwise omit this heading)*
-![[assets/fig_<X>_<Y>_<slug>.png]]
-- **How to Read This Diagram**: Explain the signal flow, axes, blocks, or geometry shown in the figure and how it maps directly to the equations in Section 2.
-
----
-
-## 4. Pre-Reading Compass (What to Watch Out For)
+## 3. Pre-Reading Compass (What to Watch Out For)
 > [!warning] Key Conceptual Leaps & Notation Traps
 > - **Leap 1**: ...
 > - **Notation Trap**: ...

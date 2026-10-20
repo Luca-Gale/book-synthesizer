@@ -121,11 +121,10 @@ Each numbered section note strictly follows this pedagogical primer layout:
    - Every equation preserved in strict Obsidian MathJax (`$...$` and `$$...$$`).
    - **Symbol & Variable Glossary Table**: Explicit definition, dimensions/units, and mathematical space (e.g., $\theta \in \mathbb{R}^d$) for every symbol introduced.
    - **Step-by-Step Derivation Logic**: Unpacks the algebraic or calculus steps the textbook authors do "in their head" between numbered equations, explicitly stating all assumptions (linearity, time-invariance, noise assumptions, boundary conditions).
-5. **`## 3. Visual Walkthrough & Diagrams`** *(when figures are present)*:
-   - Embeds cropped textbook figures (`![[fig_X_Y_1.png]]`) and walks the reader through axes, signal flows, and geometric meaning.
-6. **`## 4. Pre-Reading Compass (What to Watch Out For)`**:
+   - **Inline Visual Walkthroughs & Diagrams**: Cropped textbook figures (`![[assets/fig_X_Y_slug.png]]`) are embedded **directly inline** within the exact paragraph, derivation, or case study they illustrate, accompanied immediately by a *How to Read This Diagram* breakdown of axes, signal flows, and geometric meaning.
+5. **`## 3. Pre-Reading Compass (What to Watch Out For)`**:
    - Bullet list of the 2–3 hardest conceptual leaps or subtle notation pitfalls in this section so the reader is primed *before* reading the original textbook pages.
-7. **Protected User Annotation Zone**:
+6. **Protected User Annotation Zone**:
    - `<!-- USER NOTES BELOW THIS LINE -->` (everything below this marker is preserved untouched across re-runs).
 
 ---
