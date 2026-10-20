@@ -466,26 +466,113 @@ def cmd_crop(workspace_root: Path, cfg: dict[str, Any], args: argparse.Namespace
 def sanitize_mathjax(markdown_text: str) -> str:
     """
     Ensure Obsidian MathJax compatibility:
-    1. Ensure display blocks $$ ... $$ are surrounded by clean newlines.
-    2. Strip accidental spaces inside single-line inline math `$ x + y $` -> `$x + y$`.
+    1. Display blocks $$ ... $$ are isolated on dedicated lines with surrounding blank lines.
+    2. Protect code blocks and display math while processing inline math.
+    3. Strip accidental spaces immediately inside single-line inline math `$ x $` -> `$x$`.
+    4. Ensure separating whitespace around inline math `$x$` when touching surrounding words,
+       closing/opening parentheses, or markdown formatting, so math doesn't touch surrounding text.
     """
-    # Trim spaces immediately inside inline $...$ (only single-line, non-display math)
-    def fix_inline_math(match: re.Match[str]) -> str:
-        inner = match.group(1).strip()
-        return f"${inner}$"
+    # Step 1: Protect fenced code blocks (```...```) and inline code (`...`)
+    code_tokens: list[str] = []
+    def save_code(m: re.Match[str]) -> str:
+        code_tokens.append(m.group(0))
+        return f"\x00CODE{len(code_tokens)-1}\x00"
 
-    # Match single `$` not preceded/followed by `$` or `\`
-    cleaned = re.sub(
-        r"(?<![\\$])\$(?!\$)[ \t]+([^\n$]+?)[ \t]*\$(?!\$)",
-        fix_inline_math,
-        markdown_text,
-    )
-    cleaned = re.sub(
-        r"(?<![\\$])\$(?!\$)[ \t]*([^\n$]+?)[ \t]+\$(?!\$)",
-        fix_inline_math,
-        cleaned,
-    )
-    return cleaned
+    text = re.sub(r"```[\s\S]*?```", save_code, markdown_text)
+    text = re.sub(r"`[^`\n]+?`", save_code, text)
+
+    # Step 2: Normalize display math blocks $$...$$
+    def format_display_math(m: re.Match[str]) -> str:
+        inner = m.group(1).strip()
+        return f"\n\n$$\n{inner}\n$$\n\n"
+
+    # Standardize $$ ... $$ display blocks
+    text = re.sub(r"(?<!\\)\$\$([\s\S]*?)(?<!\\)\$\$", format_display_math, text)
+    # Collapse 3+ newlines into 2
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    # Protect display math while processing inline math
+    display_tokens: list[str] = []
+    def save_display(m: re.Match[str]) -> str:
+        display_tokens.append(m.group(0))
+        return f"\x00DISPLAY{len(display_tokens)-1}\x00"
+
+    text = re.sub(r"(?<!\\)\$\$[\s\S]*?(?<!\\)\$\$", save_display, text)
+
+    # Step 3: Process inline math line by line
+    inline_re = re.compile(r"(?<![\$\\])\$(?!\$)([^\$\n]+?)(?<![\$\\])\$(?!\$)")
+
+    lines = text.split("\n")
+    processed_lines: list[str] = []
+
+    for line in lines:
+        matches = list(inline_re.finditer(line))
+        if not matches:
+            processed_lines.append(line)
+            continue
+
+        new_line: list[str] = []
+        last_idx = 0
+
+        for m in matches:
+            start, end = m.span()
+            inner = m.group(1).strip()
+            math_str = f"${inner}$"
+
+            prefix = line[last_idx:start]
+
+            # Check boundary before opening $:
+            # - alphanumeric: "on$y$" -> "on $y$"
+            # - closing paren/bracket: ")$y$" -> ") $y$"
+            # - punctuation: ":$y$" -> ": $y$", ",$y$" -> ", $y$", ";$y$" -> "; $y$"
+            # - closing bold/italic/quote preceded by non-format/non-space: "**$y$" -> "** $y$"
+            # - table pipe: "|$y$" -> "| $y$"
+            # - protected inline code placeholder: "\x00CODE...$y$" -> "\x00CODE... $y$"
+            if prefix:
+                if re.search(r"(\w|[\)\],;:]|[^\s\*\_](\*\*|\*|__|_)|[^\s\"'](\"|')|\x00CODE\d+\x00)$", prefix):
+                    prefix += " "
+                elif prefix.endswith("|"):
+                    prefix += " "
+
+            new_line.append(prefix)
+
+            # Check boundary after closing $:
+            next_chars = line[end:]
+            suffix = ""
+            if next_chars:
+                next_char = next_chars[0]
+                # - alphanumeric: "$y$is" -> "$y$ is"
+                # - opening paren or opening quote: "$y$(which" -> "$y$ (which", "$y$\"quote\"" -> "$y$ \"quote\""
+                # - table pipe: "$y$|" -> "$y$ |"
+                # - protected code: "$y$\x00CODE" -> "$y$ \x00CODE"
+                if re.match(r"[a-zA-Z0-9\(]", next_char):
+                    suffix = " "
+                elif next_char == "|":
+                    suffix = " "
+                elif re.match(r"[\"']\w", next_chars):
+                    suffix = " "
+                elif next_chars.startswith("\x00CODE"):
+                    suffix = " "
+                elif re.match(r"(\*\*|\*|__|_)\w", next_chars):
+                    # Succeeding is bold/italic starting a new word, e.g. "$H$**time-varying**"
+                    suffix = " "
+
+            new_line.append(math_str + suffix)
+            last_idx = end
+
+        new_line.append(line[last_idx:])
+        processed_lines.append("".join(new_line))
+
+    result = "\n".join(processed_lines)
+
+    # Step 4: Restore display math and code blocks
+    for i, dt in enumerate(display_tokens):
+        result = result.replace(f"\x00DISPLAY{i}\x00", dt)
+
+    for i, ct in enumerate(code_tokens):
+        result = result.replace(f"\x00CODE{i}\x00", ct)
+
+    return result
 
 
 def extract_preserved_user_notes(existing_file: Path) -> str:
@@ -563,6 +650,8 @@ def cmd_finalize(workspace_root: Path, cfg: dict[str, Any], args: argparse.Names
             else:
                 body_part = f"{nav_line}\n\n{body_part}"
 
+        # Strip any existing trailing horizontal rules before adding the clean user notes boundary
+        body_part = re.sub(r"(\n\s*---\s*)*$", "", body_part.rstrip())
         final_content = f"{body_part.rstrip()}\n\n---\n{USER_NOTES_MARKER}\n"
         if user_notes.strip():
             final_content += f"{user_notes.strip()}\n"

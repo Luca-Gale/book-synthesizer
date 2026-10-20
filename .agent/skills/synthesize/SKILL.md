@@ -87,7 +87,10 @@ tags:
 - Walk through every mathematical formulation, model structure, or proof in the section without skipping algebraic or conceptual steps.
 - If the section contains sub-subsections (`<X.Y.1>`, `<X.Y.2>`), give each its own `### <X.Y.1> <Sub-title>` heading.
 - Explicitly highlight every **assumption** (e.g., linearity, time-invariance, zero-mean white noise, invertibility) required for the equations to hold.
-- Use strict Obsidian MathJax: `$inline$` (no spaces immediately inside `$`) and `$$display$$` on dedicated lines.
+- **Strict Obsidian MathJax & Whitespace Discipline**:
+  - Format inline math as `$inline$` (no spaces immediately inside the `$` delimiters).
+  - **CRITICAL**: Always ensure there is a space BEFORE the opening `$` and AFTER the closing `$` when adjacent to surrounding words, parentheses, or markdown bold/italic formatting (e.g. write `at time $t$ for all $t \ge 0$`, NEVER `at time$t$for all$t \ge 0$`). Do not let `$` touch adjacent letters or words. Trailing sentence punctuation (`$x$,` or `$x$.`) is allowed without a space.
+  - Format display math blocks with `$$` on dedicated lines separated by blank lines.
 
 ---
 
