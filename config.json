@@ -2,7 +2,12 @@
   "book_dir": "./book",
   "chapter_file": "./chapter.txt",
   "vault_dir": "./vault",
+  "decks_dir": "./decks",
   "cache_dir": "./.cache",
+  "anki_connect_url": "http://127.0.0.1:8765",
+  "anki_deck_root": "Textbooks",
+  "anki_basic_model": "Basic",
+  "anki_cloze_model": "Cloze",
   "render_dpi": 300,
   "crop_padding_pct": 0.05,
   "skip_section_keywords": [

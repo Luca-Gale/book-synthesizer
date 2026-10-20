@@ -1,19 +1,19 @@
 # Book-Synthesizer
 
-An **Antigravity-native** workflow and deterministic Python toolkit that transforms dense engineering, physics, and mathematics textbooks into section-by-section (`1.1`, `1.2`, ...) **Obsidian Pre-Reading Primer Notes**.
-
-It preserves physical intuition, complete mathematical derivations in standard LaTeX/MathJax, and automatically crops high-resolution (300 DPI) textbook diagrams into note assets.
+An **Antigravity-native** workflow and deterministic Python toolkit that transforms dense engineering, physics, and mathematics textbooks into:
+1. Section-by-section (`1.1`, `1.2`, ...) **Obsidian Pre-Reading Primer Notes** (preserving physical intuition, complete mathematical derivations in LaTeX/MathJax, and cropped 300-DPI textbook diagrams).
+2. Comprehensive **Anki Flashcard Decks** (`Basic` & `Cloze` with MathJax + diagrams) synced non-destructively via **AnkiConnect**.
 
 ---
 
 ## Key Features
 
-- **Pedagogical Pre-Reading Primers**: Notes structured around *The Big Idea*, *Notation & Conventions*, *Rigorous Derivations*, *Interpreting the Math*, and *Common Traps & Edge Cases*.
+- **Strict Separation of Concerns**: Clean, distraction-free reading notes in Obsidian (`vault/`); active-recall flashcards in Anki managed via a local JSON ledger (`decks/`).
+- **Non-Destructive AnkiConnect Sync**: Updates existing flashcards in place (`updateNoteFields`) without resetting your learning intervals or ease factors. Superseded/orphaned cards are safely auto-suspended (`book_synthesizer::orphaned`) rather than deleted, so you can re-enable any card you liked.
+- **Decoupled Card Refresh**: Refresh, expand, or polish flashcards for any section or chapter on demand without re-synthesizing the Obsidian chapter notes.
 - **Zero API Keys Required**: Driven entirely through Antigravity workspace skills with local document processing via `PyMuPDF` and `Pillow`.
-- **Vision-Guided Figure Cropping**: Crops figures and block diagrams directly from 300-DPI renders with automatic safety padding and embeds them cleanly into Obsidian markdown (`![[fig_...png]]`).
-- **Bidirectional Note Linking**: Automatically wires navigation links (`[[Previous Section]]`, `[[00 - Chapter MOC]]`, `[[Next Section]]`) across all section notes.
-- **User Notes Preservation**: Any notes you add under `<!-- USER NOTES BELOW THIS LINE -->` are preserved across re-synthesis runs.
-- **Ready-to-Use Obsidian Vault**: Built-in `.obsidian/` configuration pre-equipped with styles and settings for Dataview, MathLinks, LaTeX Suite, and Image Toolkit.
+- **Vision-Guided Figure Cropping**: Crops figures and block diagrams directly from 300-DPI renders with automatic safety padding, embedding them inline in Obsidian and uploading them automatically to Anki's media folder (`storeMediaFile`).
+- **Bidirectional Note Linking & User Notes Preservation**: Automatically wires navigation links (`[[Prev]]`, `[[MOC]]`, `[[Next]]`) and preserves personal notes under `<!-- USER NOTES BELOW THIS LINE -->`.
 
 ---
 
@@ -24,18 +24,27 @@ It preserves physical intuition, complete mathematical derivations in standard L
   ```bash
   pip install pymupdf pillow
   ```
-- **Obsidian** (optional, recommended for viewing and browsing notes).
+- **Obsidian** (recommended for viewing and browsing primer notes).
+- **Anki Desktop + AnkiConnect Add-on** (for live flashcard synchronization):
+  1. Open Anki Desktop $\to$ **Tools** $\to$ **Add-ons** $\to$ **Get Add-ons...**
+  2. Enter code: **`2055492159`**
+  3. Restart Anki. *(If Anki is closed during synthesis, flashcards are staged locally in `decks/` and synced whenever you run `python book_tool.py sync-anki`.)*
 
 ---
 
-## Quick Start (3 Steps)
+## Quick Start
 
-1. **Drop your textbook PDF** into the [`book/`](./book/) folder (e.g. `book/linear_systems.pdf`).
+### 1. Synthesize a Chapter (Notes + Flashcards)
+1. **Drop your textbook PDF** into [`book/`](./book/).
 2. **Set the target chapter number** in [`chapter.txt`](./chapter.txt) (e.g. `1`).
 3. **Ask Antigravity in chat**:
-   > `Synthesize the chapter` *(or invoke the `/synthesize` skill)*
+   > `Synthesize the chapter` *(or invoke `/synthesize`)*
 
-Antigravity will inspect the chapter, render the pages, extract sections, generate LaTeX notes with cropped figures, wire navigation links, and generate the Chapter Map of Content (MOC).
+### 2. Refresh or Edit Flashcards Independently
+Without re-synthesizing your Obsidian reading notes, you can ask in chat:
+- *"Generate/refresh Anki flashcards for Chapter 1"*
+- *"Refresh flashcards for section 1.3"*
+- *"Add 3 flashcards on the projection theorem in section 1.3"*
 
 ---
 
@@ -45,24 +54,26 @@ Antigravity will inspect the chapter, render the pages, extract sections, genera
 book-synthesizer/
 ├── .agent/
 │   └── skills/
-│       └── synthesize/        # Antigravity synthesis workflow definition
+│       └── synthesize/        # Antigravity synthesis & Anki workflow skill
 │           └── SKILL.md
 ├── book/                      # Active textbook PDF directory (ignored in git)
-│   └── DROP_YOUR_TEXTBOOK_PDF_HERE.txt
-├── vault/                     # Ready-to-open Obsidian vault
+├── vault/                     # Ready-to-open Obsidian vault (clean reading notes)
 │   ├── .obsidian/             # Pre-configured Obsidian settings & plugins
 │   └── <Book Title>/
 │       └── Chapter 01 - <Title>/
 │           ├── 00 - Chapter 01 MOC.md
 │           ├── 1.1 Dynamic Systems.md
-│           ├── 1.2 Models.md
 │           └── assets/
 │               └── fig_1_1_system_signals.png
-├── .cache/                    # Rendered 300-DPI page PNGs & manifests (ignored)
-├── book_tool.py               # Deterministic PDF processing & vault CLI
+├── decks/                     # Structured JSON flashcard ledgers per chapter
+│   └── <book_slug>/
+│       └── ch_01_cards.json
+├── .cache/                    # Rendered 300-DPI page PNGs & section scratch files
+├── book_tool.py               # Deterministic PDF, Vault & AnkiConnect CLI
 ├── chapter.txt                # Active chapter selector (e.g. 1)
 ├── config.json                # Customization parameters
-├── TECH_SPEC.md               # Technical specification and architecture
+├── TECH_SPEC.md               # Technical specification (Red-Team Validated)
+├── RED_TEAM_AUDIT.md          # Architectural audit log
 └── README.md
 ```
 
@@ -70,63 +81,34 @@ book-synthesizer/
 
 ## `book_tool.py` CLI Reference
 
-While Antigravity handles orchestration automatically, you can run `book_tool.py` directly from your terminal:
-
-### 1. Check Workspace Status
-Inspects the detected textbook PDF in `book/` and active chapter in `chapter.txt`:
+### 1. Check Workspace & AnkiConnect Status
 ```bash
 python book_tool.py status
 ```
 
 ### 2. Prepare Chapter Pages & Manifest
-Detects section headings, page ranges, and renders 300-DPI page images into `.cache/`:
 ```bash
 python book_tool.py prepare [--chapter N]
 ```
 
 ### 3. Crop a Figure
-Crops a bounding box `[ymin, xmin, ymax, xmax]` (normalized $0$–$1000$) from a rendered page:
 ```bash
-python book_tool.py crop --page <pdf_page_num> --box <ymin> <xmin> <ymax> <xmax> --out <filename.png>
+python book_tool.py crop --page <pdf_page_num> --bbox "<ymin>,<xmin>,<ymax>,<xmax>" --out <filename.png>
 ```
 
-### 4. Finalize Chapter Notes & Build MOC
-Sanitizes LaTeX delimiters, wires `[[Prev]]`/`[[Next]]` links, preserves user notes, and generates the Chapter Map of Content:
+### 4. Finalize Chapter Notes, Build MOC & Sync Anki
 ```bash
 python book_tool.py finalize [--chapter N]
 ```
 
----
-
-## Customization (`config.json`)
-
-You can customize tool behavior via [`config.json`](./config.json):
-
-```json
-{
-  "book_dir": "./book",
-  "chapter_file": "./chapter.txt",
-  "vault_dir": "./vault",
-  "cache_dir": "./.cache",
-  "render_dpi": 300,
-  "crop_padding_pct": 0.05,
-  "skip_section_keywords": [
-    "bibliography",
-    "references",
-    "problems",
-    "exercises",
-    "further reading",
-    "appendix",
-    "index"
-  ]
-}
+### 5. Sync Flashcards to AnkiConnect
+Aggregates section flashcards into `decks/<book_slug>/ch_XX_cards.json` and syncs non-destructively with Anki:
+```bash
+python book_tool.py sync-anki [--chapter N] [--section X.Y] [--force] [--prune]
 ```
 
----
-
-## Obsidian Integration
-
-The [`vault/`](./vault/) folder is a fully functional Obsidian vault:
-- Open Obsidian and select **"Open folder as vault"** pointing to `vault/`.
-- Pre-installed plugins include **Obsidian LaTeX Suite** (inline math shortcuts), **MathLinks**, **Dataview**, **Image Toolkit** (click-to-zoom for textbook diagrams), and **Table Editor**.
-- If you already have an existing vault, you can drag and drop any `<Book Title>` folder into your existing vault without breaking note links or asset paths.
+### 6. Inspect Existing Notes to Refresh Flashcards
+Inspects existing synthesized Obsidian notes and current deck ledgers without re-rendering PDF pages:
+```bash
+python book_tool.py refresh-cards [--chapter N] [--section X.Y]
+```

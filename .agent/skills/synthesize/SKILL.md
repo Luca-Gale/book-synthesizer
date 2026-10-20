@@ -2,13 +2,14 @@
 name: synthesize
 description: >-
   Synthesize the active textbook chapter specified in chapter.txt (from the PDF in book/)
-  into dedicated section-by-section (X.1, X.2, ...) Obsidian Pre-Reading Primer notes,
-  preserving full mathematical rigor (LaTeX), physical intuition, and cropped textbook diagrams.
+  into dedicated section-by-section (X.1, X.2, ...) Obsidian Pre-Reading Primer notes
+  and high-yield Anki flashcards synced non-destructively via AnkiConnect. Also supports
+  refreshing, adding, or editing flashcards independently without re-synthesizing notes.
 ---
 
-# Textbook Chapter Synthesizer (`/synthesize`)
+# Textbook Chapter Synthesizer & Anki Flashcard Engine (`/synthesize`)
 
-Use this skill whenever the user says **"synthesize"**, **"run"**, **"summarize the chapter"**, or invokes `/synthesize`.
+Use this skill whenever the user says **"synthesize"**, **"run"**, **"summarize the chapter"**, **"generate/refresh flashcards"**, **"sync anki"**, or invokes `/synthesize`.
 
 ---
 
@@ -16,28 +17,30 @@ Use this skill whenever the user says **"synthesize"**, **"run"**, **"summarize 
 
 1. **Zero Friction Input**:
    - Never ask the user for the PDF path or chapter number unless `book/` is empty.
-   - Always read the active PDF from `./book/*.pdf` and the target chapter number `X` from `./chapter.txt` via `python book_tool.py prepare`.
-2. **Granularity = Numbered Section (`X.1`, `X.2`, ..., `X.k`)**:
-   - Every main numbered section of Chapter `X` (`1.1`, `1.2`, `1.3`, ...) gets **1 dedicated Obsidian `.md` file**.
-   - Deeper sub-subsections (`1.3.1`, `1.3.2`) stay **inside** `1.3 <Title>.md` as `###` headings.
-   - **Automatically ignore** non-primer sections: *Bibliography*, *References*, *Problems*, *Exercises*, *Historical Notes*, *Appendices*.
-3. **No Verbatim Source Dumps**:
-   - Do **not** copy-paste verbatim textbook paragraphs at the bottom of the note.
-   - The note must act as a **comprehensive Pre-Reading Primer** (Intuition + Complete Mathematical Rigor + Cropped Figures + Pre-Reading Compass) that prepares the user before they read the actual section in the book.
+   - Always read the active PDF from `./book/*.pdf` and the target chapter number `X` from `./chapter.txt` via `python book_tool.py prepare` (or `python book_tool.py refresh-cards` when only working on flashcards).
+2. **Strict Separation of Concerns (Notes in Obsidian, Flashcards in Anki)**:
+   - Every main numbered section of Chapter `X` (`1.1`, `1.2`, `1.3`, ...) gets **1 dedicated, distraction-free Obsidian `.md` file** in `vault/`. Never clutter the reading note with flashcard Q&A blocks.
+   - All flashcards for section `X.Y` are written to `.cache/<book_slug>/ch_<XX>/cards_<X>_<Y>.json`, which `book_tool.py` aggregates into `decks/<book_slug>/ch_<XX>_cards.json` and syncs to Anki (`Textbooks::<Book Name>::Chapter <XX>::<X.Y Section Title>`) via **AnkiConnect**.
+3. **Comprehensive High-Yield Flashcard Extraction**:
+   - Do not artificially cap the number of cards per section: **convert everything worth remembering into a flashcard** (core definitions, governing equations, physical/geometric intuition, key assumptions, notation meanings, and diagram interpretations).
+   - Mix **`Basic`** cards (conceptual Q&A, physical intuition, assumptions, diagram reading) and **`Cloze`** cards (`{{c1::...}}` for equations, matrix structures, and precise conditions).
+4. **Non-Destructive Anki Sync**:
+   - Updating a card's wording or equations preserves its `id` and `anki_note_id`, invoking `updateNoteFields` so Anki **100% preserves review intervals and ease factors**.
+   - Cards removed on a refresh are never hard-deleted automatically; they are tagged `book_synthesizer::orphaned` and **auto-suspended** in Anki so they leave the daily review queue while remaining recoverable.
 
 ---
 
-## Step-by-Step Execution Workflow
+## Workflow A: Full Chapter Synthesis (Obsidian Primers + Anki Flashcards)
 
 ### Step 1: Prepare & Slice the Target Chapter
-1. Run `python book_tool.py prepare` (using `BypassSandbox: true` if Windows `exebox` sandbox is unsupported on the host OS).
+1. Run `python book_tool.py prepare`.
 2. Inspect the JSON output (`manifest.json`):
    - Check if `active_sections_to_synthesize` accurately lists the chapter's numbered sections (`X.1`, `X.2`, ...) and their PDF page ranges.
-   - **Fallback if PDF Bookmarks Were Missing**: If `active_sections_to_synthesize` is empty or incomplete because the PDF lacks section bookmarks, use `read_file` to inspect the first rendered page(s) or Table of Contents pages in `.cache/<book>/ch_<XX>/pages/`, visually identify the 1-based PDF start/end pages of Chapter `X` and its `X.Y` sections, and re-run:
+   - **Fallback if PDF Bookmarks Were Missing**: Visually inspect the first rendered page(s) or Table of Contents pages in `.cache/<book>/ch_<XX>/pages/` with `read_file`, identify the 1-based PDF start/end pages of Chapter `X`, and re-run:
      `python book_tool.py prepare --pages <START_PDF_PAGE>-<END_PDF_PAGE> --chapter-title "<Chapter Title>"`
 
 ### Step 2: Parallel Section Synthesis (`1 Subagent per Section X.Y`)
-For each non-skipped section `X.Y` in the chapter (either via parallel `invoke_subagent` calls with `TypeName: "self"` for chapters with 3+ sections, or sequentially for 1–2 sections):
+For each non-skipped section `X.Y` in the chapter (via parallel `invoke_subagent` calls with `TypeName: "self"` for 3+ sections, or sequentially for 1–2 sections):
 
 1. **Visually Read the Section Pages**:
    - Call `read_file` on the rendered 300-DPI PNG images (`pdf_page_XXXX.png`) covering section `X.Y`.
@@ -46,9 +49,9 @@ For each non-skipped section `X.Y` in the chapter (either via parallel `invoke_s
      ```powershell
      python book_tool.py crop --page <PDF_PAGE_NUM> --bbox "<ymin>,<xmin>,<ymax>,<xmax>" --out "fig_<X>_<Y>_<short_slug>.png"
      ```
-   - Inspect the cropped PNG in `vault/.../assets/` with `read_file` if needed to verify no axis labels were clipped.
+   - Inspect the cropped PNG in `vault/.../assets/` with `read_file` to verify no axis labels were clipped.
 3. **Write the Dedicated Section Primer Note (`<vault_chapter_dir>/<X.Y> <Clean Section Title>.md`)**:
-   - Write the note using the exact structure below:
+   - Follow this exact structure:
 
 ```markdown
 ---
@@ -92,7 +95,7 @@ tags:
   - Immediately beneath each embedded figure, include a concise **How to Read This Diagram** walkthrough explaining the axes, blocks, signal flows, or geometry and how they map to the surrounding equations.
 - **Strict Obsidian MathJax & Whitespace Discipline**:
   - Format inline math as `$inline$` (no spaces immediately inside the `$` delimiters).
-  - **CRITICAL**: Always ensure there is a space BEFORE the opening `$` and AFTER the closing `$` when adjacent to surrounding words, parentheses, or markdown bold/italic formatting (e.g. write `at time $t$ for all $t \ge 0$`, NEVER `at time$t$for all$t \ge 0$`). Do not let `$` touch adjacent letters or words. Trailing sentence punctuation (`$x$,` or `$x$.`) is allowed without a space.
+  - Always ensure there is a space BEFORE the opening `$` and AFTER the closing `$` when adjacent to surrounding words, parentheses, or markdown bold/italic formatting.
   - Format display math blocks with `$$` on dedicated lines separated by blank lines.
 
 ---
@@ -107,13 +110,63 @@ tags:
 <!-- USER NOTES BELOW THIS LINE -->
 ```
 
-### Step 3: Finalize Vault Links & Chapter MOC
-1. Once all `X.Y` section notes for Chapter `X` are written, run:
+4. **Write the Section Flashcards Scratch File (`.cache/<book_slug>/ch_<XX>/cards_<X>_<Y>.json`)**:
+   - Extract **everything worth remembering** from section `X.Y` into high-yield flashcards and save to the `cards_scratch_path` specified in `manifest.json`:
+   ```json
+   {
+     "section": "<X.Y>",
+     "section_title": "<Clean Section Title>",
+     "cards": [
+       {
+         "id": "ch0<X>_s<X>_<Y>_c01",
+         "model": "Basic",
+         "front": "What is the physical and mathematical role of $e(t)$ in the ARX model structure?",
+         "back": "$e(t)$ represents the **equation error** (or innovation disturbance) entering directly into the difference equation:\n$$A(q)y(t) = B(q)u(t) + e(t)$$\nIt is assumed to be zero-mean white noise with variance $\\lambda$.",
+         "tags": ["arx", "assumptions"],
+         "media": []
+       },
+       {
+         "id": "ch0<X>_s<X>_<Y>_c02",
+         "model": "Cloze",
+         "front": "In linear regression $\\hat{y}(t|\\theta) = \\varphi^T(t)\\theta$, the least-squares estimate minimizing $V_N(\\theta)$ is given by {{c1::$\\hat{\\theta}_N = \\left[\\sum_{t=1}^N \\varphi(t)\\varphi^T(t)\\right]^{-1} \\sum_{t=1}^N \\varphi(t)y(t)$}} provided that {{c2::the regression matrix is invertible (persistency of excitation)}}.",
+         "back": "![[assets/fig_1_1_system_signals.png]]\nThe regressor vector $\\varphi(t)$ contains past inputs and outputs.",
+         "tags": ["least-squares", "derivation"],
+         "media": ["fig_1_1_system_signals.png"]
+       }
+     ]
+   }
+   ```
+   - *Note*: `book_tool.py` automatically converts `$...$` / `$$...$$` to Anki's `\(...\)` / `\[...\]` with HTML-safe escaping (`&lt;`, `&gt;`, `&amp;`), and automatically uploads any cropped figures in `media` or `![[assets/...]]` to Anki's media folder via `storeMediaFile`.
+
+### Step 3: Finalize Vault Links, Chapter MOC & Sync to AnkiConnect
+1. Once all `X.Y` section notes and `cards_<X>_<Y>.json` files are written, run in the main agent thread:
    ```powershell
    python book_tool.py finalize
    ```
-2. This automatically:
-   - Generates `00 - Chapter XX MOC.md` linking all section notes in order.
-   - Injects `← [[Prev]] | [[Chapter X MOC]] | [[Next]] →` navigation headers into every section note.
-   - Sanitizes MathJax syntax and preserves any existing notes below `<!-- USER NOTES BELOW THIS LINE -->`.
-3. Present a concise summary to the user with clickable links to the generated MOC and section notes.
+2. This single-threaded command automatically:
+   - Generates `00 - Chapter XX MOC.md` and injects `← [[Prev]] | [[Chapter X MOC]] | [[Next]] →` navigation headers.
+   - Sanitizes Obsidian MathJax syntax and preserves user notes below `<!-- USER NOTES BELOW THIS LINE -->`.
+   - Aggregates all `.cache/.../cards_<X>_<Y>.json` files into `decks/<book_slug>/ch_<XX>_cards.json`.
+   - Connects to **AnkiConnect** (`127.0.0.1:8765`), uploads cropped figure media, creates the nested subdecks (`Textbooks::<Book>::Chapter XX::<X.Y Title>`), adds new cards, updates modified cards via `updateNoteFields`, and suspends any orphaned cards (or stages them offline if Anki is closed).
+
+---
+
+## Workflow B: Independent Flashcard Refresh, Generation, or Editing (Without Re-Synthesizing Notes)
+
+Whenever the user asks to **generate flashcards for an already-synthesized chapter**, **refresh flashcards** to keep revision fresh, or **add/modify specific cards** without touching the Obsidian notes:
+
+1. **Inspect Existing Notes & Current Ledger**:
+   ```powershell
+   python book_tool.py refresh-cards [--chapter <X>] [--section <X.Y>]
+   ```
+2. **Read & Extract / Refine Cards**:
+   - Read the existing Obsidian `.md` primer note(s) listed in `sections_to_refresh` using `read_file`.
+   - Inspect `existing_cards` for that section:
+     - When **modifying or polishing** an existing card, **keep its `id`** (e.g. `ch01_s1_3_c02`) so Anki updates it in-place without resetting its learning interval.
+     - When **adding** new cards, assign the next sequential `id`.
+     - When **replacing or retiring** a card, omit it from the updated `cards` array—`book_tool.py` will automatically suspend it in Anki (`book_synthesizer::orphaned`) so the user never loses it permanently and can manually un-suspend it if desired.
+   - Write the updated `.cache/<book_slug>/ch_<XX>/cards_<X>_<Y>.json` file(s).
+3. **Sync to Anki**:
+   ```powershell
+   python book_tool.py sync-anki [--chapter <X>] [--section <X.Y>]
+   ```

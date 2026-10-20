@@ -1,25 +1,34 @@
 #!/usr/bin/env python3
 """
-book_tool.py — Local PDF & Obsidian Vault Toolkit for Book-Synthesizer.
+book_tool.py — Local PDF, Obsidian Vault & AnkiConnect Toolkit for Book-Synthesizer.
 
 Designed to be orchestrated by Antigravity (zero external LLM API keys required).
-Provides four deterministic commands:
-  1. status   : Inspect active PDF in ./book/ and target chapter in ./chapter.txt
-  2. prepare  : Extract ToC/sections for the target chapter and render 300-DPI page PNGs
-  3. crop     : Crop a figure bounding box [ymin, xmin, ymax, xmax] with 5% padding into vault assets
-  4. finalize : Sanitize MathJax, wire [[Prev]]/[[MOC]]/[[Next]] links, preserve user notes, & build Chapter MOC
+Provides six deterministic commands:
+  1. status        : Inspect active PDF in ./book/, target chapter in ./chapter.txt, and AnkiConnect status
+  2. prepare       : Extract ToC/sections for the target chapter and render 300-DPI page PNGs
+  3. crop          : Crop a figure bounding box [ymin, xmin, ymax, xmax] with 5% padding into vault assets
+  4. finalize      : Sanitize MathJax, wire [[Prev]]/[[MOC]]/[[Next]] links, build MOC, & sync Anki cards
+  5. sync-anki     : Aggregate section flashcards into ./decks/ and sync non-destructively via AnkiConnect
+  6. refresh-cards : Inspect existing Obsidian notes & card ledgers to refresh flashcards without re-synthesizing notes
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import datetime
+import hashlib
+import html
 import json
 import re
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
 USER_NOTES_MARKER = "<!-- USER NOTES BELOW THIS LINE -->"
+ORPHAN_TAG = "book_synthesizer::orphaned"
 
 
 def load_config(workspace_root: Path) -> dict[str, Any]:
@@ -28,7 +37,12 @@ def load_config(workspace_root: Path) -> dict[str, Any]:
         "book_dir": "./book",
         "chapter_file": "./chapter.txt",
         "vault_dir": "./vault",
+        "decks_dir": "./decks",
         "cache_dir": "./.cache",
+        "anki_connect_url": "http://127.0.0.1:8765",
+        "anki_deck_root": "Textbooks",
+        "anki_basic_model": "Basic",
+        "anki_cloze_model": "Cloze",
         "render_dpi": 300,
         "crop_padding_pct": 0.05,
         "skip_section_keywords": [
@@ -52,9 +66,7 @@ def load_config(workspace_root: Path) -> dict[str, Any]:
 
 def sanitize_filename(name: str) -> str:
     """Convert raw section/chapter titles into Windows & Obsidian safe filenames."""
-    # Replace em-dash, en-dash, colons, slashes with clean hyphen
     cleaned = re.sub(r"[—–:/\\|?*\"<>]", " - ", name)
-    # Collapse multiple spaces/hyphens
     cleaned = re.sub(r"\s*-\s*-\s*", " - ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" .-")
     return cleaned
@@ -103,10 +115,6 @@ def should_skip_section(title: str, skip_keywords: list[str]) -> bool:
 def parse_toc_for_chapter(
     toc: list[list[Any]], target_ch: str, total_pages: int, skip_keywords: list[str]
 ) -> dict[str, Any] | None:
-    """
-    Attempt to locate Chapter `target_ch` and its numbered sections `X.Y` from PDF bookmarks.
-    `toc` items from PyMuPDF are `[level, title, page_1based]`.
-    """
     if not toc:
         return None
 
@@ -126,7 +134,6 @@ def parse_toc_for_chapter(
 
     for i, (lvl, title, page) in enumerate(toc):
         clean_t = title.strip()
-        # Avoid matching "1.1" as Chapter 1
         if re.match(rf"^0*{re.escape(target_ch)}\.\d+", clean_t):
             continue
         m = ch_pattern.match(clean_t)
@@ -141,14 +148,12 @@ def parse_toc_for_chapter(
     if ch_idx is None:
         return None
 
-    # Find where this chapter ends (next bookmark at <= ch_level)
     for j in range(ch_idx + 1, len(toc)):
         lvl, _title, page = toc[j]
         if lvl <= ch_level and page >= ch_start_page:
             ch_end_page = max(ch_start_page, page - 1)
             break
 
-    # Collect X.Y sections inside this chapter
     raw_sections: list[dict[str, Any]] = []
     for j in range(ch_idx + 1, len(toc)):
         lvl, title, page = toc[j]
@@ -168,11 +173,9 @@ def parse_toc_for_chapter(
                 }
             )
 
-    # Calculate end_pdf_page for each section
     for idx, sec in enumerate(raw_sections):
         if idx + 1 < len(raw_sections):
             next_start = raw_sections[idx + 1]["start_pdf_page"]
-            # Sections often share a boundary page where one ends and the next begins
             sec["end_pdf_page"] = max(sec["start_pdf_page"], next_start)
         else:
             sec["end_pdf_page"] = ch_end_page
@@ -189,10 +192,6 @@ def parse_toc_for_chapter(
 def scan_text_for_chapter_sections(
     doc: Any, target_ch: str, skip_keywords: list[str]
 ) -> dict[str, Any]:
-    """
-    Fallback when PDF bookmarks are missing or incomplete:
-    Scans page text for lines matching `X.1 ...`, `X.2 ...` and Table of Contents entries.
-    """
     sec_heading_re = re.compile(
         rf"(?m)^\s*({re.escape(target_ch)}\.[1-9]\d*)\s+([A-Z][^\n\r{{}}0-9]{{2,90}}?)(?:\s+(\d{{1,4}}))?\s*$"
     )
@@ -208,7 +207,6 @@ def scan_text_for_chapter_sections(
             sec_num = match.group(1)
             sec_title = " ".join(match.group(2).split()).strip(" .…-")
             trailing_page = match.group(3)
-            # If it's in the body (no trailing page number, or after frontmatter)
             if not trailing_page and sec_num not in section_hits:
                 section_hits[sec_num] = {
                     "section_number": sec_num,
@@ -249,8 +247,6 @@ def scan_text_for_chapter_sections(
 def render_pdf_pages(
     doc: Any, start_page: int, end_page: int, out_dir: Path, dpi: int
 ) -> list[dict[str, Any]]:
-    import fitz
-
     out_dir.mkdir(parents=True, exist_ok=True)
     rendered: list[dict[str, Any]] = []
     start_p = max(1, start_page)
@@ -289,20 +285,824 @@ def get_vault_chapter_dir(
     return vault_root / clean_book / folder_name
 
 
+def get_deck_ledger_path(
+    workspace_root: Path, cfg: dict[str, Any], book_slug: str, ch_num: str
+) -> Path:
+    decks_root = (workspace_root / cfg.get("decks_dir", "./decks")).resolve()
+    book_decks_dir = decks_root / book_slug
+    book_decks_dir.mkdir(parents=True, exist_ok=True)
+    return book_decks_dir / f"ch_{int(ch_num):02d}_cards.json"
+
+
+# ============================================================================
+# AnkiConnect Client & MathJax / HTML Formatting Engine
+# ============================================================================
+
+def anki_request(url: str, action: str, timeout: float = 5.0, **params: Any) -> Any:
+    """Invoke AnkiConnect HTTP API on localhost."""
+    payload: dict[str, Any] = {"action": action, "version": 6}
+    if params:
+        payload["params"] = params
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    if len(data) != 2:
+        raise RuntimeError(f"Unexpected AnkiConnect response format: {data}")
+    if data.get("error") is not None:
+        raise RuntimeError(f"AnkiConnect error in '{action}': {data['error']}")
+    return data.get("result")
+
+
+def check_anki_connection(url: str) -> bool:
+    """Return True if Anki is running with AnkiConnect listening."""
+    try:
+        ver = anki_request(url, "version", timeout=2.0)
+        return ver is not None
+    except Exception:
+        return False
+
+
+def resolve_anki_models(url: str, cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """
+    Query AnkiConnect for available note types and their exact field names.
+    Handles English ('Basic', 'Cloze') and localized Anki installs (e.g. Italian 'Basilare', 'Base', 'Omissione').
+    """
+    model_names: list[str] = anki_request(url, "modelNames") or []
+    pref_basic = cfg.get("anki_basic_model", "Basic")
+    pref_cloze = cfg.get("anki_cloze_model", "Cloze")
+
+    basic_candidates = [pref_basic, "Basic", "Basilare", "Base", "Basic (and reversed card)"]
+    cloze_candidates = [pref_cloze, "Cloze", "Omissione", "Cloze (overlapping)"]
+
+    chosen_basic = None
+    for cand in basic_candidates:
+        for m in model_names:
+            if m.lower() == cand.lower():
+                chosen_basic = m
+                break
+        if chosen_basic:
+            break
+    if not chosen_basic:
+        for m in model_names:
+            if "basic" in m.lower() or "basilar" in m.lower() or "base" in m.lower():
+                chosen_basic = m
+                break
+    if not chosen_basic and model_names:
+        chosen_basic = model_names[0]
+
+    chosen_cloze = None
+    for cand in cloze_candidates:
+        for m in model_names:
+            if m.lower() == cand.lower():
+                chosen_cloze = m
+                break
+        if chosen_cloze:
+            break
+    if not chosen_cloze:
+        for m in model_names:
+            if "cloze" in m.lower() or "omission" in m.lower():
+                chosen_cloze = m
+                break
+    if not chosen_cloze and chosen_basic:
+        chosen_cloze = chosen_basic
+
+    result: dict[str, dict[str, Any]] = {}
+    for logical_name, actual_name in [("Basic", chosen_basic), ("Cloze", chosen_cloze)]:
+        if not actual_name:
+            raise RuntimeError("No valid note models found in Anki profile.")
+        fields: list[str] = anki_request(url, "modelFieldNames", modelName=actual_name) or []
+        if len(fields) < 2:
+            raise RuntimeError(f"Anki model '{actual_name}' has fewer than 2 fields: {fields}")
+        result[logical_name] = {
+            "model_name": actual_name,
+            "front_field": fields[0],
+            "back_field": fields[1],
+            "all_fields": fields,
+        }
+    return result
+
+
+def make_anki_media_filename(book_slug: str, ch_num: str, raw_filename: str) -> str:
+    clean_name = Path(raw_filename).name
+    prefix = f"{book_slug}_ch{int(ch_num):02d}_"
+    if clean_name.startswith(prefix):
+        return clean_name
+    return f"{prefix}{clean_name}"
+
+
+def _escape_math_for_anki_html(math_inner: str) -> str:
+    """
+    Escape &, <, > inside MathJax expressions so Anki's HTML DOM parser does not
+    interpret `< y` or matrix `&` as HTML tags or broken entities.
+    """
+    s = re.sub(r"&(?!(?:amp|lt|gt|quot|#\d+);)", "&amp;", math_inner)
+    s = s.replace("<", "&lt;").replace(">", "&gt;")
+    if s.endswith("}"):
+        s += " "
+    return s
+
+
+def _split_math_by_balanced_clozes(math_str: str) -> list[tuple[bool, str]]:
+    """
+    Parse a math expression that may contain `{{c1::...}}` or `{{c2::...}}` with nested LaTeX `{...}` braces.
+    Returns a list of `(is_cloze, content)` segments so that `{{c1::...}}` can be hoisted OUTSIDE `\\(...\\)`.
+    Why? In Anki 23.10+/24+, putting `{{c1::...}}` INSIDE `\\[...\\]` or `\\(...\\)` suppresses the `<span class="cloze" data-cloze="...">`
+    DOM element, which breaks the editor preview! Putting `\\(...\\)` INSIDE `{{c1::\\(...\\)}}` guarantees both
+    a valid `<span class="cloze" data-cloze="...">` AND eliminates `}}}` brace collisions!
+    """
+    segments: list[tuple[bool, str]] = []
+    cloze_start_re = re.compile(r"\{\{c\d+::")
+    pos = 0
+    n = len(math_str)
+
+    while pos < n:
+        m = cloze_start_re.search(math_str, pos)
+        if not m:
+            rem = math_str[pos:]
+            if rem:
+                segments.append((False, rem))
+            break
+
+        if m.start() > pos:
+            segments.append((False, math_str[pos : m.start()]))
+
+        # Scan forward from m.end() balancing single `{` and `}` until we hit closing `}}` at depth 0
+        idx = m.end()
+        brace_depth = 0
+        cloze_end_inner = None
+        while idx < n:
+            if math_str[idx] == "\\" and idx + 1 < n and math_str[idx + 1] in "{}":
+                idx += 2
+                continue
+            if math_str[idx] == "{":
+                brace_depth += 1
+                idx += 1
+            elif math_str[idx] == "}":
+                if brace_depth > 0:
+                    brace_depth -= 1
+                    idx += 1
+                elif idx + 1 < n and math_str[idx + 1] == "}":
+                    cloze_end_inner = idx
+                    idx += 2
+                    break
+                else:
+                    idx += 1
+            else:
+                idx += 1
+
+        if cloze_end_inner is not None:
+            segments.append((True, math_str[m.end() : cloze_end_inner]))
+            pos = idx
+        else:
+            # Fallback if unclosed
+            segments.append((False, math_str[m.start() :]))
+            break
+
+    return segments
+
+
+def _format_math_block_for_anki(math_inner: str, is_display: bool) -> str:
+    """
+    Format a math block for Anki:
+    - If it contains no `{{cN::...}}`, wrap in `\\[...\\]` (display) or `\\(...\\)` (inline).
+    - If it contains `{{cN::...}}`, hoist `{{c1::...}}` OUTSIDE the MathJax delimiters so Anki always
+      renders `<span class="cloze" data-cloze="...">` and never suffers from `}}}` LaTeX brace collisions.
+    """
+    stripped = math_inner.strip()
+    if not re.search(r"\{\{c\d+::", stripped):
+        esc = _escape_math_for_anki_html(stripped)
+        return f"\\[{esc}\\]" if is_display else f"\\({esc}\\)"
+
+    segments = _split_math_by_balanced_clozes(stripped)
+    # Check if the entire math block is a single cloze
+    non_empty = [(is_c, seg.strip()) for is_c, seg in segments if seg.strip()]
+    if len(non_empty) == 1 and non_empty[0][0]:
+        esc = _escape_math_for_anki_html(non_empty[0][1])
+        return f"{{{{c1::\\({esc}\\)}}}}"
+
+    out_parts: list[str] = []
+    for is_cloze, seg in segments:
+        s = seg.strip()
+        if not s:
+            continue
+        esc = _escape_math_for_anki_html(s)
+        if is_cloze:
+            out_parts.append(f"{{{{c1::\\({esc}\\)}}}}")
+        else:
+            out_parts.append(f"\\({esc}\\)")
+
+    joined = " ".join(out_parts)
+    return f"<br>{joined}<br>" if is_display else joined
+
+
+def convert_markdown_and_math_to_anki(
+    raw_text: str, book_slug: str, ch_num: str
+) -> tuple[str, list[str]]:
+    """
+    Token-aware converter from Obsidian Markdown + LaTeX ($...$, $$...$$) to Anki HTML + MathJax (\\(...\\), \\[...\\]).
+    - Protects fenced and inline code blocks.
+    - Extracts Obsidian image embeds ![[assets/fig.png]] or <img src="fig.png"> and rewrites to Anki media filenames.
+    - Converts $$...$$ and $...$ to Anki MathJax while hoisting any `{{cN::...}}` outside `\\(...\\)` so Anki's
+      Cloze preview always works and `}}}` brace collisions cannot occur.
+    - Normalizes all `{{c2::...}}`, `{{c3::...}}` to `{{c1::...}}` so 1 flashcard = 1 card in Anki (never registered twice).
+    """
+    if not raw_text:
+        return "", []
+
+    discovered_media: list[str] = []
+
+    # Step 1: Protect fenced code blocks and inline code
+    code_tokens: list[str] = []
+
+    def save_fenced_code(m: re.Match[str]) -> str:
+        inner = html.escape(m.group(1).strip())
+        code_tokens.append(f"<pre><code>{inner}</code></pre>")
+        return f"\x00ANKICODE{len(code_tokens)-1}\x00"
+
+    def save_inline_code(m: re.Match[str]) -> str:
+        inner = html.escape(m.group(1))
+        code_tokens.append(f"<code>{inner}</code>")
+        return f"\x00ANKICODE{len(code_tokens)-1}\x00"
+
+    text = re.sub(r"```(?:\w+)?\n?([\s\S]*?)```", save_fenced_code, raw_text)
+    text = re.sub(r"`([^`\n]+?)`", save_inline_code, text)
+
+    # Step 2: Extract & rewrite image embeds: ![[assets/fig.png]] or ![[fig.png]] or <img src="...">
+    img_tokens: list[str] = []
+
+    def replace_obsidian_img(m: re.Match[str]) -> str:
+        raw_target = m.group(1).split("|")[0].strip()
+        base_name = Path(raw_target).name
+        if base_name not in discovered_media:
+            discovered_media.append(base_name)
+        anki_fname = make_anki_media_filename(book_slug, ch_num, base_name)
+        img_tokens.append(f'<br><img src="{anki_fname}">')
+        return f"\x00ANKIIMG{len(img_tokens)-1}\x00"
+
+    def replace_html_img(m: re.Match[str]) -> str:
+        raw_src = m.group(1).strip()
+        base_name = Path(raw_src).name
+        if base_name not in discovered_media:
+            discovered_media.append(base_name)
+        anki_fname = make_anki_media_filename(book_slug, ch_num, base_name)
+        img_tokens.append(f'<img src="{anki_fname}">')
+        return f"\x00ANKIIMG{len(img_tokens)-1}\x00"
+
+    text = re.sub(r"!\[\[([^\]]+?)\]\]", replace_obsidian_img, text)
+    text = re.sub(r'<img\s+[^>]*src=["\']([^"\']+)["\'][^>]*>', replace_html_img, text, flags=re.IGNORECASE)
+
+    # Step 3: Convert \[...\], \(...\), $$...$$, and $...$ using cloze-safe math formatter
+    math_tokens: list[str] = []
+
+    def save_display_math(m: re.Match[str]) -> str:
+        formatted = _format_math_block_for_anki(m.group(1), is_display=True)
+        math_tokens.append(formatted)
+        return f"\x00ANKIMATH{len(math_tokens)-1}\x00"
+
+    def save_inline_math(m: re.Match[str]) -> str:
+        formatted = _format_math_block_for_anki(m.group(1), is_display=False)
+        math_tokens.append(formatted)
+        return f"\x00ANKIMATH{len(math_tokens)-1}\x00"
+
+    # Existing \[...\] and \(...\)
+    text = re.sub(r"\\\[([\s\S]*?)\\\]", save_display_math, text)
+    text = re.sub(r"\\\(([\s\S]*?)\\\)", save_inline_math, text)
+
+    # Display $$...$$
+    text = re.sub(r"(?<!\\)\$\$([\s\S]*?)(?<!\\)\$\$", save_display_math, text)
+
+    # Inline $...$ (single line, not preceded or followed by \ or $)
+    text = re.sub(r"(?<![\$\\])\$(?!\$)([^\$\n]+?)(?<![\$\\])\$(?!\$)", save_inline_math, text)
+
+    # Unescape literal \$ outside math
+    text = text.replace(r"\$", "$")
+
+    # Normalize any remaining {{c2::...}}, {{c3::...}} outside math to {{c1::...}} so 1 note = 1 card
+    text = re.sub(r"\{\{c\d+::", "{{c1::", text)
+
+    # Step 4: Convert basic Markdown formatting outside math/code
+    text = re.sub(r"\*\*([^\*\n]+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"(?<!\*)\*([^\*\n]+?)\*(?!\*)", r"<i>\1</i>", text)
+
+    # Convert newlines to <br>
+    text = text.strip()
+    text = re.sub(r"\r?\n", "<br>", text)
+
+    # Step 5: Restore tokens
+    for i, mt in enumerate(math_tokens):
+        text = text.replace(f"\x00ANKIMATH{i}\x00", mt)
+    for i, it in enumerate(img_tokens):
+        text = text.replace(f"\x00ANKIIMG{i}\x00", it)
+    for i, ct in enumerate(code_tokens):
+        text = text.replace(f"\x00ANKICODE{i}\x00", ct)
+
+    # Clean up excessive <br>
+    text = re.sub(r"(<br>\s*){3,}", "<br><br>", text)
+    text = re.sub(r"^(<br>\s*)+|(<br>\s*)+$", "", text)
+
+    return text, discovered_media
+
+
+def compute_card_hash(
+    subdeck: str, model_type: str, anki_front: str, anki_back: str, tags: list[str]
+) -> str:
+    payload = json.dumps(
+        {
+            "subdeck": subdeck,
+            "model_type": model_type,
+            "front": anki_front,
+            "back": anki_back,
+            "tags": sorted(set(tags)),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def normalize_model_type(raw_model: str, front_text: str) -> str:
+    """Detect whether a card is Basic or Cloze."""
+    if re.search(r"\{\{c\d+::", front_text):
+        return "Cloze"
+    if raw_model and "cloze" in raw_model.lower():
+        return "Cloze"
+    return "Basic"
+
+
+def aggregate_chapter_cards(
+    workspace_root: Path,
+    cfg: dict[str, Any],
+    book_name: str,
+    ch_num: str,
+    section_filter: str | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    """
+    Single-threaded aggregator: merges per-section `.cache/<book_slug>/ch_<XX>/cards_<X>_<Y>.json`
+    into the persistent chapter ledger `decks/<book_slug>/ch_<XX>_cards.json`.
+    """
+    book_slug = slugify(book_name)
+    cache_ch_dir = (workspace_root / cfg["cache_dir"] / book_slug / f"ch_{int(ch_num):02d}").resolve()
+    ledger_path = get_deck_ledger_path(workspace_root, cfg, book_slug, ch_num)
+
+    clean_book_title = re.sub(r"\s+", " ", sanitize_filename(book_name).replace("_", " ")).strip()
+    deck_root = cfg.get("anki_deck_root", "Textbooks")
+    if ledger_path.exists():
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        deck_prefix = ledger.get("deck_prefix") or f"{deck_root}::{clean_book_title}::Chapter {int(ch_num):02d}"
+    else:
+        deck_prefix = f"{deck_root}::{clean_book_title}::Chapter {int(ch_num):02d}"
+        ledger = {
+            "book": book_name,
+            "book_slug": book_slug,
+            "chapter": int(ch_num),
+            "deck_prefix": deck_prefix,
+            "last_synced": None,
+            "cards": [],
+        }
+
+    ledger["book"] = book_name
+    ledger["book_slug"] = book_slug
+    ledger["chapter"] = int(ch_num)
+    ledger["deck_prefix"] = deck_prefix
+
+    existing_cards: list[dict[str, Any]] = ledger.get("cards", [])
+
+    scratch_files = sorted(cache_ch_dir.glob("cards_*.json")) if cache_ch_dir.exists() else []
+    if not scratch_files:
+        for card in existing_cards:
+            if card.get("status") == "orphaned":
+                continue
+            raw_front = card.get("raw_front") or card.get("front", "")
+            raw_back = card.get("raw_back") or card.get("back", "")
+            anki_front, media_f = convert_markdown_and_math_to_anki(raw_front, book_slug, ch_num)
+            anki_back, media_b = convert_markdown_and_math_to_anki(raw_back, book_slug, ch_num)
+            all_media = list(dict.fromkeys((card.get("media") or []) + media_f + media_b))
+            model_type = normalize_model_type(card.get("model_name", "Basic"), anki_front)
+            card["model_name"] = model_type
+            card["anki_front"] = anki_front
+            card["anki_back"] = anki_back
+            card["media"] = [Path(m).name for m in all_media]
+            card["status"] = card.get("status", "active")
+        ledger_path.write_text(json.dumps(ledger, indent=2, ensure_ascii=False), encoding="utf-8")
+        return ledger_path, ledger
+
+    by_section: dict[str, list[dict[str, Any]]] = {}
+    for c in existing_cards:
+        sec = str(c.get("section", ""))
+        by_section.setdefault(sec, []).append(c)
+
+    updated_sections: set[str] = set()
+    new_section_cards: dict[str, list[dict[str, Any]]] = {}
+
+    for sfile in scratch_files:
+        try:
+            sdata = json.loads(sfile.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"Warning: Failed to parse {sfile}: {exc}", file=sys.stderr)
+            continue
+
+        sec_num = str(sdata.get("section", "")).strip()
+        if not sec_num:
+            m_sec = re.search(r"cards_(\d+)_(\d+)", sfile.stem)
+            sec_num = f"{m_sec.group(1)}.{m_sec.group(2)}" if m_sec else f"{ch_num}.1"
+
+        if section_filter and sec_num != section_filter:
+            continue
+
+        updated_sections.add(sec_num)
+        sec_title = sanitize_filename(sdata.get("section_title") or sdata.get("subdeck") or f"Section {sec_num}")
+        if not sec_title.startswith(sec_num):
+            subdeck_name = f"{sec_num} {sec_title}"
+        else:
+            subdeck_name = sec_title
+
+        old_sec_cards = by_section.get(sec_num, [])
+        old_by_id = {c["id"]: c for c in old_sec_cards if "id" in c}
+        old_by_front = {
+            (c.get("raw_front") or c.get("front", "")).strip().lower(): c
+            for c in old_sec_cards
+        }
+        matched_old_ids: set[str] = set()
+        merged_for_sec: list[dict[str, Any]] = []
+
+        raw_cards_list = sdata.get("cards", [])
+        for idx, rc in enumerate(raw_cards_list, start=1):
+            default_id = f"ch{int(ch_num):02d}_s{sec_num.replace('.', '_')}_c{idx:02d}"
+            cid = rc.get("id") or default_id
+            raw_front = (rc.get("raw_front") or rc.get("front") or "").strip()
+            raw_back = (rc.get("raw_back") or rc.get("back") or "").strip()
+            if not raw_front:
+                continue
+
+            matched_old = old_by_id.get(cid)
+            if not matched_old and raw_front.lower() in old_by_front:
+                candidate = old_by_front[raw_front.lower()]
+                if candidate.get("id") not in matched_old_ids:
+                    matched_old = candidate
+                    cid = candidate.get("id", cid)
+
+            if matched_old and matched_old.get("id"):
+                matched_old_ids.add(matched_old["id"])
+
+            anki_front, media_f = convert_markdown_and_math_to_anki(raw_front, book_slug, ch_num)
+            anki_back, media_b = convert_markdown_and_math_to_anki(raw_back, book_slug, ch_num)
+
+            explicit_media = [Path(m).name for m in (rc.get("media") or [])]
+            all_media = list(dict.fromkeys(explicit_media + media_f + media_b))
+
+            model_type = normalize_model_type(
+                rc.get("model") or rc.get("model_name") or "Basic", anki_front
+            )
+
+            base_tags = [
+                book_slug[:24],
+                f"chapter-{int(ch_num):02d}",
+                f"sec-{sec_num}",
+            ]
+            custom_tags = [
+                re.sub(r"\s+", "-", t.strip().lower())
+                for t in (rc.get("tags") or [])
+                if t.strip() and t.strip() != ORPHAN_TAG
+            ]
+            tags = list(dict.fromkeys(base_tags + custom_tags))
+
+            entry: dict[str, Any] = {
+                "id": cid,
+                "section": sec_num,
+                "subdeck": subdeck_name,
+                "model_name": model_type,
+                "raw_front": raw_front,
+                "raw_back": raw_back,
+                "anki_front": anki_front,
+                "anki_back": anki_back,
+                "tags": tags,
+                "media": all_media,
+                "status": "active",
+                "content_hash": matched_old.get("content_hash") if matched_old else None,
+                "anki_note_id": matched_old.get("anki_note_id") if matched_old else None,
+                "anki_actual_model": matched_old.get("anki_actual_model") if matched_old else None,
+                "synced": matched_old.get("synced", False) if matched_old else False,
+            }
+            merged_for_sec.append(entry)
+
+        for old_c in old_sec_cards:
+            old_id = old_c.get("id")
+            if old_id not in matched_old_ids:
+                if old_c.get("anki_note_id") is not None:
+                    was_already_orphaned = old_c.get("status") == "orphaned"
+                    old_c["status"] = "orphaned"
+                    if not was_already_orphaned:
+                        old_c["synced"] = False
+                    merged_for_sec.append(old_c)
+
+        new_section_cards[sec_num] = merged_for_sec
+
+    all_sec_keys = sorted(
+        set(by_section.keys()) | set(new_section_cards.keys()),
+        key=lambda s: [int(x) if x.isdigit() else 999 for x in s.split(".")],
+    )
+    final_cards: list[dict[str, Any]] = []
+    for sec_key in all_sec_keys:
+        if sec_key in updated_sections:
+            final_cards.extend(new_section_cards[sec_key])
+        else:
+            final_cards.extend(by_section.get(sec_key, []))
+
+    ledger["cards"] = final_cards
+    ledger_path.write_text(json.dumps(ledger, indent=2, ensure_ascii=False), encoding="utf-8")
+    return ledger_path, ledger
+
+
+def find_asset_file(
+    workspace_root: Path, cfg: dict[str, Any], book_name: str, ch_num: str, filename: str
+) -> Path | None:
+    """Locate a cropped figure PNG in the chapter's vault assets directory."""
+    vault_root = (workspace_root / cfg["vault_dir"]).resolve()
+    clean_book = sanitize_filename(book_name)
+    book_vault_dir = vault_root / clean_book
+    if book_vault_dir.exists():
+        for p in book_vault_dir.rglob(filename):
+            if p.is_file():
+                return p
+    for p in vault_root.rglob(filename):
+        if p.is_file():
+            return p
+    return None
+
+
+def sync_chapter_to_anki(
+    workspace_root: Path,
+    cfg: dict[str, Any],
+    book_name: str,
+    ch_num: str,
+    section_filter: str | None = None,
+    force: bool = False,
+    prune: bool = False,
+) -> dict[str, Any]:
+    """
+    Aggregate section flashcards into `decks/<book_slug>/ch_<XX>_cards.json` and
+    synchronize non-destructively with Anki via AnkiConnect.
+    """
+    ledger_path, ledger = aggregate_chapter_cards(
+        workspace_root, cfg, book_name, ch_num, section_filter=section_filter
+    )
+    cards: list[dict[str, Any]] = ledger.get("cards", [])
+    book_slug = ledger["book_slug"]
+    deck_prefix = ledger["deck_prefix"]
+    url = cfg.get("anki_connect_url", "http://127.0.0.1:8765")
+
+    active_cards = [c for c in cards if c.get("status", "active") == "active"]
+    orphaned_cards = [c for c in cards if c.get("status") == "orphaned"]
+
+    if not check_anki_connection(url):
+        for c in active_cards:
+            new_h = compute_card_hash(
+                c["subdeck"],
+                c["model_name"],
+                c.get("anki_front", ""),
+                c.get("anki_back", ""),
+                c.get("tags", []),
+            )
+            if c.get("content_hash") != new_h or c.get("anki_note_id") is None:
+                c["synced"] = False
+        ledger_path.write_text(json.dumps(ledger, indent=2, ensure_ascii=False), encoding="utf-8")
+        pending = sum(1 for c in cards if not c.get("synced", False))
+        return {
+            "anki_connected": False,
+            "ledger_path": str(ledger_path.resolve()),
+            "active_cards": len(active_cards),
+            "orphaned_cards": len(orphaned_cards),
+            "pending_sync": pending,
+            "message": (
+                "Anki is offline or AnkiConnect (127.0.0.1:8765) is not reachable. "
+                f"{len(active_cards)} active flashcards are safely staged in '{ledger_path.name}'. "
+                "Open Anki and run `python book_tool.py sync-anki` anytime to push them."
+            ),
+        }
+
+    models_map = resolve_anki_models(url, cfg)
+
+    # 1. Upload referenced media assets to Anki's collection.media
+    uploaded_media: list[str] = []
+    seen_media: set[str] = set()
+    for c in active_cards:
+        if section_filter and str(c.get("section")) != section_filter:
+            continue
+        for raw_m in c.get("media", []):
+            base_m = Path(raw_m).name
+            if base_m in seen_media:
+                continue
+            seen_media.add(base_m)
+            asset_path = find_asset_file(workspace_root, cfg, book_name, ch_num, base_m)
+            if asset_path and asset_path.exists():
+                anki_fname = make_anki_media_filename(book_slug, ch_num, base_m)
+                b64_data = base64.b64encode(asset_path.read_bytes()).decode("ascii")
+                anki_request(
+                    url,
+                    "storeMediaFile",
+                    filename=anki_fname,
+                    data=b64_data,
+                )
+                uploaded_media.append(anki_fname)
+
+    # 2. Query existing notesInfo for all known anki_note_ids
+    known_ids = [
+        int(c["anki_note_id"])
+        for c in cards
+        if c.get("anki_note_id") is not None
+    ]
+    existing_notes_by_id: dict[int, dict[str, Any]] = {}
+    if known_ids:
+        notes_info = anki_request(url, "notesInfo", notes=known_ids) or []
+        for ni in notes_info:
+            if ni and ni.get("noteId"):
+                existing_notes_by_id[int(ni["noteId"])] = ni
+
+    stats = {
+        "added": 0,
+        "updated": 0,
+        "unchanged": 0,
+        "suspended_orphans": 0,
+        "pruned_orphans": 0,
+        "model_migrations": 0,
+    }
+
+    anki_request(url, "createDeck", deck=deck_prefix)
+
+    kept_cards: list[dict[str, Any]] = []
+    for c in cards:
+        if section_filter and str(c.get("section")) != section_filter:
+            kept_cards.append(c)
+            continue
+
+        status = c.get("status", "active")
+        note_id = int(c["anki_note_id"]) if c.get("anki_note_id") is not None else None
+        existing_info = existing_notes_by_id.get(note_id) if note_id else None
+
+        # Handle Orphaned Cards
+        if status == "orphaned":
+            if existing_info:
+                if prune:
+                    anki_request(url, "deleteNotes", notes=[note_id])
+                    stats["pruned_orphans"] += 1
+                    continue
+                elif not c.get("synced", False) or force:
+                    card_ids = existing_info.get("cards", [])
+                    if card_ids:
+                        anki_request(url, "suspend", cards=card_ids)
+                    anki_request(url, "addTags", notes=[note_id], tags=ORPHAN_TAG)
+                    c["synced"] = True
+                    stats["suspended_orphans"] += 1
+            else:
+                if prune:
+                    continue
+                c["synced"] = True
+            kept_cards.append(c)
+            continue
+
+        # Handle Active Cards
+        subdeck = c.get("subdeck") or f"Section {c.get('section', '1.1')}"
+        full_deck_name = f"{deck_prefix}::{subdeck}"
+        anki_request(url, "createDeck", deck=full_deck_name)
+
+        anki_front = c.get("anki_front") or ""
+        anki_back = c.get("anki_back") or ""
+        logical_model = normalize_model_type(c.get("model_name", "Basic"), anki_front)
+        c["model_name"] = logical_model
+        model_spec = models_map[logical_model]
+        actual_model_name = model_spec["model_name"]
+        front_field = model_spec["front_field"]
+        back_field = model_spec["back_field"]
+
+        tags = [t for t in c.get("tags", []) if t != ORPHAN_TAG]
+        c["tags"] = tags
+        new_hash = compute_card_hash(subdeck, logical_model, anki_front, anki_back, tags)
+
+        # Check if note model changed
+        if existing_info is not None and existing_info.get("modelName") != actual_model_name:
+            old_card_ids = existing_info.get("cards", [])
+            if old_card_ids:
+                anki_request(url, "suspend", cards=old_card_ids)
+            anki_request(url, "addTags", notes=[note_id], tags=ORPHAN_TAG)
+            c.setdefault("previous_note_ids", []).append(note_id)
+            existing_info = None
+            note_id = None
+            stats["model_migrations"] += 1
+
+        # If an existing Cloze note previously had >1 sibling cards (e.g. from c2) and now only has c1,
+        # check if it has 0 reviews; if unreviewed, replace it cleanly so Anki doesn't keep an empty Carta 2!
+        if existing_info is not None and len(existing_info.get("cards", [])) > 1 and "{{c2::" not in anki_front:
+            c_infos = anki_request(url, "cardsInfo", cards=existing_info["cards"]) or []
+            total_reps = sum(int(ci.get("reps", 0)) for ci in c_infos)
+            if total_reps == 0:
+                anki_request(url, "deleteNotes", notes=[note_id])
+                existing_info = None
+                note_id = None
+            else:
+                # Suspend the extra sibling card(s) with ord > 0 so reviews on ord 0 are preserved
+                extra_cards = [int(ci["cardId"]) for ci in c_infos if int(ci.get("ord", 0)) > 0]
+                if extra_cards:
+                    anki_request(url, "suspend", cards=extra_cards)
+
+        if existing_info is None:
+            note_payload = {
+                "deckName": full_deck_name,
+                "modelName": actual_model_name,
+                "fields": {
+                    front_field: anki_front,
+                    back_field: anki_back,
+                },
+                "options": {
+                    "allowDuplicate": True,
+                },
+                "tags": tags,
+            }
+            new_note_id = anki_request(url, "addNote", note=note_payload)
+            c["anki_note_id"] = int(new_note_id)
+            c["anki_actual_model"] = actual_model_name
+            c["content_hash"] = new_hash
+            c["synced"] = True
+            stats["added"] += 1
+        else:
+            if c.get("content_hash") != new_hash or not c.get("synced", False) or force:
+                anki_request(
+                    url,
+                    "updateNoteFields",
+                    note={
+                        "id": note_id,
+                        "fields": {
+                            front_field: anki_front,
+                            back_field: anki_back,
+                        },
+                    },
+                )
+                card_ids = existing_info.get("cards", [])
+                if card_ids:
+                    anki_request(url, "changeDeck", cards=card_ids, deck=full_deck_name)
+                    if ORPHAN_TAG in (existing_info.get("tags") or []):
+                        anki_request(url, "unsuspend", cards=card_ids)
+                        anki_request(url, "removeTags", notes=[note_id], tags=ORPHAN_TAG)
+
+                if tags:
+                    anki_request(url, "addTags", notes=[note_id], tags=" ".join(tags))
+
+                c["anki_actual_model"] = actual_model_name
+                c["content_hash"] = new_hash
+                c["synced"] = True
+                stats["updated"] += 1
+            else:
+                stats["unchanged"] += 1
+
+        kept_cards.append(c)
+
+    ledger["cards"] = kept_cards
+    ledger["last_synced"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    ledger_path.write_text(json.dumps(ledger, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    return {
+        "anki_connected": True,
+        "ledger_path": str(ledger_path.resolve()),
+        "deck_prefix": deck_prefix,
+        "stats": stats,
+        "media_uploaded": uploaded_media,
+        "total_active_cards": sum(1 for c in kept_cards if c.get("status", "active") == "active"),
+        "total_orphaned_cards": sum(1 for c in kept_cards if c.get("status") == "orphaned"),
+    }
+
+
+# ============================================================================
+# CLI Commands
+# ============================================================================
+
 def cmd_status(workspace_root: Path, cfg: dict[str, Any]) -> None:
     import fitz
 
     pdf_path = find_active_pdf(workspace_root / cfg["book_dir"])
     ch_num = read_target_chapter(workspace_root / cfg["chapter_file"])
+    book_name = pdf_path.stem
+    book_slug = slugify(book_name)
     doc = fitz.open(str(pdf_path))
     toc = doc.get_toc()
+    anki_url = cfg.get("anki_connect_url", "http://127.0.0.1:8765")
+    anki_online = check_anki_connection(anki_url)
+    ledger_path = get_deck_ledger_path(workspace_root, cfg, book_slug, ch_num)
+
     info = {
         "active_pdf": str(pdf_path.resolve()),
-        "book_name": pdf_path.stem,
+        "book_name": book_name,
         "total_pdf_pages": len(doc),
         "has_bookmarks": len(toc) > 0,
         "bookmark_count": len(toc),
         "target_chapter": ch_num,
+        "anki_connect_url": anki_url,
+        "anki_connected": anki_online,
+        "chapter_deck_ledger": str(ledger_path.resolve()),
+        "chapter_deck_exists": ledger_path.exists(),
     }
     print(json.dumps(info, indent=2))
 
@@ -357,16 +1157,21 @@ def cmd_prepare(workspace_root: Path, cfg: dict[str, Any], args: argparse.Namesp
     ch_vault_dir.mkdir(parents=True, exist_ok=True)
     (ch_vault_dir / "assets").mkdir(parents=True, exist_ok=True)
 
-    # Enrich each section with its target markdown file path
+    ledger_path = get_deck_ledger_path(workspace_root, cfg, book_slug, ch_num)
+
     for sec in parsed["sections"]:
         sec_num = sec["section_number"]
         clean_title = sanitize_filename(sec["title"])
         md_filename = f"{sec_num} {clean_title}.md"
         sec["note_filename"] = md_filename
         sec["note_path"] = str((ch_vault_dir / md_filename).resolve())
+        sec["cards_scratch_path"] = str(
+            (cache_ch_dir / f"cards_{sec_num.replace('.', '_')}.json").resolve()
+        )
 
     manifest = {
         "book_name": book_name,
+        "book_slug": book_slug,
         "pdf_path": str(pdf_path.resolve()),
         "total_pdf_pages": len(doc),
         "chapter_number": ch_num,
@@ -376,6 +1181,8 @@ def cmd_prepare(workspace_root: Path, cfg: dict[str, Any], args: argparse.Namesp
         "end_pdf_page": parsed["end_pdf_page"],
         "vault_chapter_dir": str(ch_vault_dir.resolve()),
         "assets_dir": str((ch_vault_dir / "assets").resolve()),
+        "deck_ledger_path": str(ledger_path.resolve()),
+        "cache_chapter_dir": str(cache_ch_dir.resolve()),
         "cache_pages_dir": str(pages_dir.resolve()),
         "sections": parsed["sections"],
         "active_sections_to_synthesize": [
@@ -412,7 +1219,6 @@ def cmd_crop(workspace_root: Path, cfg: dict[str, Any], args: argparse.Namespace
     page_num = int(args.page)
     page_img_path = Path(manifest["cache_pages_dir"]) / f"pdf_page_{page_num:04d}.png"
     if not page_img_path.exists():
-        # Render on demand if outside initial slice
         import fitz
 
         doc = fitz.open(str(pdf_path))
@@ -427,7 +1233,6 @@ def cmd_crop(workspace_root: Path, cfg: dict[str, Any], args: argparse.Namespace
 
     ymin, xmin, ymax, xmax = coords
     if not args.pixels:
-        # Convert 0..1000 normalized coordinates to pixel coordinates
         ymin = (ymin / 1000.0) * height
         ymax = (ymax / 1000.0) * height
         xmin = (xmin / 1000.0) * width
@@ -464,16 +1269,8 @@ def cmd_crop(workspace_root: Path, cfg: dict[str, Any], args: argparse.Namespace
 
 
 def sanitize_mathjax(markdown_text: str) -> str:
-    """
-    Ensure Obsidian MathJax compatibility:
-    1. Display blocks $$ ... $$ are isolated on dedicated lines with surrounding blank lines.
-    2. Protect code blocks and display math while processing inline math.
-    3. Strip accidental spaces immediately inside single-line inline math `$ x $` -> `$x$`.
-    4. Ensure separating whitespace around inline math `$x$` when touching surrounding words,
-       closing/opening parentheses, or markdown formatting, so math doesn't touch surrounding text.
-    """
-    # Step 1: Protect fenced code blocks (```...```) and inline code (`...`)
     code_tokens: list[str] = []
+
     def save_code(m: re.Match[str]) -> str:
         code_tokens.append(m.group(0))
         return f"\x00CODE{len(code_tokens)-1}\x00"
@@ -481,25 +1278,21 @@ def sanitize_mathjax(markdown_text: str) -> str:
     text = re.sub(r"```[\s\S]*?```", save_code, markdown_text)
     text = re.sub(r"`[^`\n]+?`", save_code, text)
 
-    # Step 2: Normalize display math blocks $$...$$
     def format_display_math(m: re.Match[str]) -> str:
         inner = m.group(1).strip()
         return f"\n\n$$\n{inner}\n$$\n\n"
 
-    # Standardize $$ ... $$ display blocks
     text = re.sub(r"(?<!\\)\$\$([\s\S]*?)(?<!\\)\$\$", format_display_math, text)
-    # Collapse 3+ newlines into 2
     text = re.sub(r"\n{3,}", "\n\n", text)
 
-    # Protect display math while processing inline math
     display_tokens: list[str] = []
+
     def save_display(m: re.Match[str]) -> str:
         display_tokens.append(m.group(0))
         return f"\x00DISPLAY{len(display_tokens)-1}\x00"
 
     text = re.sub(r"(?<!\\)\$\$[\s\S]*?(?<!\\)\$\$", save_display, text)
 
-    # Step 3: Process inline math line by line
     inline_re = re.compile(r"(?<![\$\\])\$(?!\$)([^\$\n]+?)(?<![\$\\])\$(?!\$)")
 
     lines = text.split("\n")
@@ -520,14 +1313,6 @@ def sanitize_mathjax(markdown_text: str) -> str:
             math_str = f"${inner}$"
 
             prefix = line[last_idx:start]
-
-            # Check boundary before opening $:
-            # - alphanumeric: "on$y$" -> "on $y$"
-            # - closing paren/bracket: ")$y$" -> ") $y$"
-            # - punctuation: ":$y$" -> ": $y$", ",$y$" -> ", $y$", ";$y$" -> "; $y$"
-            # - closing bold/italic/quote preceded by non-format/non-space: "**$y$" -> "** $y$"
-            # - table pipe: "|$y$" -> "| $y$"
-            # - protected inline code placeholder: "\x00CODE...$y$" -> "\x00CODE... $y$"
             if prefix:
                 if re.search(r"(\w|[\)\],;:]|[^\s\*\_](\*\*|\*|__|_)|[^\s\"'](\"|')|\x00CODE\d+\x00)$", prefix):
                     prefix += " "
@@ -536,15 +1321,10 @@ def sanitize_mathjax(markdown_text: str) -> str:
 
             new_line.append(prefix)
 
-            # Check boundary after closing $:
             next_chars = line[end:]
             suffix = ""
             if next_chars:
                 next_char = next_chars[0]
-                # - alphanumeric: "$y$is" -> "$y$ is"
-                # - opening paren or opening quote: "$y$(which" -> "$y$ (which", "$y$\"quote\"" -> "$y$ \"quote\""
-                # - table pipe: "$y$|" -> "$y$ |"
-                # - protected code: "$y$\x00CODE" -> "$y$ \x00CODE"
                 if re.match(r"[a-zA-Z0-9\(]", next_char):
                     suffix = " "
                 elif next_char == "|":
@@ -554,7 +1334,6 @@ def sanitize_mathjax(markdown_text: str) -> str:
                 elif next_chars.startswith("\x00CODE"):
                     suffix = " "
                 elif re.match(r"(\*\*|\*|__|_)\w", next_chars):
-                    # Succeeding is bold/italic starting a new word, e.g. "$H$**time-varying**"
                     suffix = " "
 
             new_line.append(math_str + suffix)
@@ -565,7 +1344,6 @@ def sanitize_mathjax(markdown_text: str) -> str:
 
     result = "\n".join(processed_lines)
 
-    # Step 4: Restore display math and code blocks
     for i, dt in enumerate(display_tokens):
         result = result.replace(f"\x00DISPLAY{i}\x00", dt)
 
@@ -603,7 +1381,6 @@ def cmd_finalize(workspace_root: Path, cfg: dict[str, Any], args: argparse.Names
     moc_name = f"00 - Chapter {int(ch_num):02d} MOC"
     moc_path = ch_vault_dir / f"{moc_name}.md"
 
-    # Discover all section markdown files in the chapter folder (excluding the MOC itself)
     sec_files = sorted(
         [
             p
@@ -633,7 +1410,6 @@ def cmd_finalize(workspace_root: Path, cfg: dict[str, Any], args: argparse.Names
         next_link = f"[[{sec_files[idx + 1].stem}]] →" if idx + 1 < len(sec_files) else "*End of Chapter* →"
         nav_line = f"> **Navigation**: {prev_link} | **[[{moc_name}|Chapter {ch_num} MOC]]** | {next_link}"
 
-        # Replace existing navigation callout if present, or insert after frontmatter / top H1
         nav_pattern = re.compile(r"^> \*\*Navigation\*\*:.*$", re.MULTILINE)
         if nav_pattern.search(body_part):
             body_part = nav_pattern.sub(nav_line, body_part)
@@ -650,7 +1426,6 @@ def cmd_finalize(workspace_root: Path, cfg: dict[str, Any], args: argparse.Names
             else:
                 body_part = f"{nav_line}\n\n{body_part}"
 
-        # Strip any existing trailing horizontal rules before adding the clean user notes boundary
         body_part = re.sub(r"(\n\s*---\s*)*$", "", body_part.rstrip())
         final_content = f"{body_part.rstrip()}\n\n---\n{USER_NOTES_MARKER}\n"
         if user_notes.strip():
@@ -660,7 +1435,6 @@ def cmd_finalize(workspace_root: Path, cfg: dict[str, Any], args: argparse.Names
         updated_notes.append(note_path.name)
         moc_entries.append(f"- [[{note_path.stem}]]")
 
-    # Build the Chapter MOC file
     skipped_list = manifest.get("skipped_sections", [])
     skipped_md = (
         "\n".join(f"- *{s['section_number']} {s['title']} (Skipped — Non-Primer Section)*" for s in skipped_list)
@@ -699,12 +1473,131 @@ tags:
 
     moc_path.write_text(moc_content, encoding="utf-8")
 
+    anki_sync_report = sync_chapter_to_anki(
+        workspace_root, cfg, book_name, ch_num
+    )
+
     summary = {
         "moc_path": str(moc_path.resolve()),
         "finalized_section_notes": updated_notes,
         "vault_chapter_dir": str(ch_vault_dir.resolve()),
+        "anki_sync": anki_sync_report,
     }
     print(json.dumps(summary, indent=2))
+
+
+def cmd_sync_anki(workspace_root: Path, cfg: dict[str, Any], args: argparse.Namespace) -> None:
+    pdf_path = find_active_pdf(workspace_root / cfg["book_dir"])
+    ch_num = str(args.chapter) if args.chapter else read_target_chapter(workspace_root / cfg["chapter_file"])
+    book_name = pdf_path.stem
+
+    report = sync_chapter_to_anki(
+        workspace_root,
+        cfg,
+        book_name,
+        ch_num,
+        section_filter=args.section,
+        force=args.force,
+        prune=args.prune,
+    )
+    print(json.dumps(report, indent=2))
+
+
+def cmd_refresh_cards(workspace_root: Path, cfg: dict[str, Any], args: argparse.Namespace) -> None:
+    pdf_path = find_active_pdf(workspace_root / cfg["book_dir"])
+    ch_num = str(args.chapter) if args.chapter else read_target_chapter(workspace_root / cfg["chapter_file"])
+    book_name = pdf_path.stem
+    book_slug = slugify(book_name)
+
+    vault_root = (workspace_root / cfg["vault_dir"]).resolve()
+    clean_book = sanitize_filename(book_name)
+    book_vault_dir = vault_root / clean_book
+
+    ch_dirs = (
+        sorted(book_vault_dir.glob(f"Chapter {int(ch_num):02d}*"))
+        if book_vault_dir.exists()
+        else []
+    )
+    if not ch_dirs:
+        raise FileNotFoundError(
+            f"No existing synthesized vault folder found for Chapter {ch_num} in '{book_vault_dir}'. "
+            "Run `/synthesize` first to create the Obsidian chapter notes."
+        )
+    ch_vault_dir = ch_dirs[0]
+    assets_dir = ch_vault_dir / "assets"
+    available_assets = sorted(p.name for p in assets_dir.glob("*.png")) if assets_dir.exists() else []
+
+    cache_ch_dir = (workspace_root / cfg["cache_dir"] / book_slug / f"ch_{int(ch_num):02d}").resolve()
+    cache_ch_dir.mkdir(parents=True, exist_ok=True)
+
+    ledger_path = get_deck_ledger_path(workspace_root, cfg, book_slug, ch_num)
+    existing_cards: list[dict[str, Any]] = []
+    if ledger_path.exists():
+        ledger_data = json.loads(ledger_path.read_text(encoding="utf-8"))
+        existing_cards = ledger_data.get("cards", [])
+
+    sec_files = sorted(
+        [
+            p
+            for p in ch_vault_dir.glob("*.md")
+            if re.match(rf"^0*{re.escape(ch_num)}\.\d+\b", p.name)
+        ],
+        key=lambda p: [
+            int(x)
+            for x in re.match(r"^(\d+\.\d+)", p.name).group(1).split(".")
+        ],
+    )
+
+    sections_info: list[dict[str, Any]] = []
+    for note_path in sec_files:
+        m = re.match(r"^(\d+\.\d+)\s+(.*)$", note_path.stem)
+        if not m:
+            continue
+        sec_num = m.group(1)
+        sec_title = m.group(2)
+        if args.section and sec_num != args.section:
+            continue
+
+        sec_existing_cards = [
+            {
+                "id": c.get("id"),
+                "model_name": c.get("model_name"),
+                "raw_front": c.get("raw_front") or c.get("front"),
+                "raw_back": c.get("raw_back") or c.get("back"),
+                "tags": c.get("tags", []),
+                "media": c.get("media", []),
+                "status": c.get("status", "active"),
+                "anki_note_id": c.get("anki_note_id"),
+            }
+            for c in existing_cards
+            if str(c.get("section")) == sec_num
+        ]
+
+        sections_info.append(
+            {
+                "section_number": sec_num,
+                "section_title": sec_title,
+                "note_path": str(note_path.resolve()),
+                "cards_scratch_path": str(
+                    (cache_ch_dir / f"cards_{sec_num.replace('.', '_')}.json").resolve()
+                ),
+                "existing_card_count": len(sec_existing_cards),
+                "existing_cards": sec_existing_cards,
+            }
+        )
+
+    info = {
+        "book_name": book_name,
+        "book_slug": book_slug,
+        "chapter_number": ch_num,
+        "vault_chapter_dir": str(ch_vault_dir.resolve()),
+        "assets_dir": str(assets_dir.resolve()),
+        "available_assets": available_assets,
+        "deck_ledger_path": str(ledger_path.resolve()),
+        "anki_connected": check_anki_connection(cfg.get("anki_connect_url", "http://127.0.0.1:8765")),
+        "sections_to_refresh": sections_info,
+    }
+    print(json.dumps(info, indent=2))
 
 
 def main() -> None:
@@ -712,11 +1605,11 @@ def main() -> None:
     cfg = load_config(workspace_root)
 
     parser = argparse.ArgumentParser(
-        description="Local PDF & Obsidian Vault Toolkit for Book-Synthesizer"
+        description="Local PDF, Obsidian Vault & AnkiConnect Toolkit for Book-Synthesizer"
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("status", help="Check active PDF in ./book/ and target chapter in ./chapter.txt")
+    sub.add_parser("status", help="Check active PDF, target chapter, and AnkiConnect status")
 
     p_prep = sub.add_parser("prepare", help="Slice target chapter, detect X.Y sections, and render 300-DPI PNGs")
     p_prep.add_argument("--chapter", type=str, default=None, help="Override chapter number from chapter.txt")
@@ -730,8 +1623,21 @@ def main() -> None:
     p_crop.add_argument("--out", type=str, required=True, help="Output figure filename (e.g. fig_1_3_arx.png)")
     p_crop.add_argument("--pixels", action="store_true", help="Interpret --bbox as raw pixel coordinates")
 
-    p_fin = sub.add_parser("finalize", help="Sanitize MathJax, inject [[Prev]]/[[Next]] links, and build Chapter MOC")
+    p_fin = sub.add_parser("finalize", help="Sanitize MathJax, inject [[Prev]]/[[Next]] links, build MOC, & sync Anki")
     p_fin.add_argument("--chapter", type=str, default=None, help="Override chapter number")
+
+    p_sync = sub.add_parser("sync-anki", help="Aggregate section flashcards into ./decks/ and sync via AnkiConnect")
+    p_sync.add_argument("--chapter", type=str, default=None, help="Override chapter number")
+    p_sync.add_argument("--section", type=str, default=None, help="Only aggregate/sync a specific section (e.g. 1.3)")
+    p_sync.add_argument("--force", action="store_true", help="Force update all card fields in Anki even if hash matches")
+    p_sync.add_argument("--prune", action="store_true", help="Permanently delete orphaned cards from Anki instead of suspending")
+
+    p_ref = sub.add_parser(
+        "refresh-cards",
+        help="Inspect existing Obsidian section notes & card ledger to refresh flashcards without re-synthesizing notes",
+    )
+    p_ref.add_argument("--chapter", type=str, default=None, help="Override chapter number")
+    p_ref.add_argument("--section", type=str, default=None, help="Target a single section (e.g. 1.3)")
 
     args = parser.parse_args()
     if args.command == "status":
@@ -742,6 +1648,10 @@ def main() -> None:
         cmd_crop(workspace_root, cfg, args)
     elif args.command == "finalize":
         cmd_finalize(workspace_root, cfg, args)
+    elif args.command == "sync-anki":
+        cmd_sync_anki(workspace_root, cfg, args)
+    elif args.command == "refresh-cards":
+        cmd_refresh_cards(workspace_root, cfg, args)
 
 
 if __name__ == "__main__":
