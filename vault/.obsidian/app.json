@@ -1,0 +1,14 @@
+{
+  "baseTheme": "dark",
+  "alwaysUpdateLinks": true,
+  "attachmentFolderPath": "assets",
+  "useMarkdownLinks": false,
+  "showLineNumber": true,
+  "livePreview": true,
+  "defaultViewMode": "source",
+  "foldHeading": true,
+  "foldIndent": true,
+  "promptDelete": false,
+  "readableLineLength": true,
+  "strictLineBreaks": false
+}

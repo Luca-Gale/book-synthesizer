@@ -1,0 +1,20 @@
+{
+  "book_dir": "./book",
+  "chapter_file": "./chapter.txt",
+  "vault_dir": "./vault",
+  "cache_dir": "./.cache",
+  "render_dpi": 300,
+  "crop_padding_pct": 0.05,
+  "skip_section_keywords": [
+    "bibliography",
+    "references",
+    "problems",
+    "exercises",
+    "further reading",
+    "historical notes",
+    "appendix",
+    "solutions",
+    "acknowledgements",
+    "index"
+  ]
+}

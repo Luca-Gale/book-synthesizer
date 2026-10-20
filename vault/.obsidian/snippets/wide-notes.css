@@ -1,0 +1,10 @@
+/* 
+ * Edit and save this file to adjust note width & margins in real-time in Obsidian.
+ */
+body {
+  /* How wide the note content is (you can use % like 80%, or pixels like 1200px) */
+  --file-line-width: 80%;
+
+  /* Outer padding around the note: <top/bottom> <left/right> */
+  --file-margins: 32px 48px;
+}

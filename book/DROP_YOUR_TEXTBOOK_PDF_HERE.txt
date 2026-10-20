@@ -1,0 +1,2 @@
+Drag and drop the engineering/math textbook PDF you are currently studying into this `book/` folder.
+`book-synthesizer` will automatically detect the PDF file in this folder.
