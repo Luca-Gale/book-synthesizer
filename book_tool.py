@@ -835,6 +835,47 @@ def find_asset_file(
     return None
 
 
+def propagate_parent_deck_config(
+    url: str, deck_root: str, deck_prefix: str, target_decks: list[str]
+) -> dict[str, Any] | None:
+    """
+    Ensure newly created or synced subdecks automatically inherit the Anki Deck Options preset
+    configured on the book deck (`Textbooks::<Book>`) or root deck (`Textbooks`).
+    """
+    try:
+        anki_request(url, "createDeck", deck=deck_root)
+        parts = deck_prefix.split("::")
+        book_deck = "::".join(parts[:2]) if len(parts) >= 2 else deck_root
+        anki_request(url, "createDeck", deck=book_deck)
+
+        root_cfg = anki_request(url, "getDeckConfig", deck=deck_root) or {}
+        book_cfg = anki_request(url, "getDeckConfig", deck=book_deck) or {}
+
+        # Prefer a custom preset on the Book deck if it differs from Default (id=1);
+        # otherwise inherit from the Root deck (`Textbooks`).
+        if book_cfg.get("id") and int(book_cfg["id"]) != 1:
+            chosen_cfg = book_cfg
+            source_deck = book_deck
+        else:
+            chosen_cfg = root_cfg
+            source_deck = deck_root
+
+        config_id = chosen_cfg.get("id")
+        if config_id is None:
+            return None
+
+        all_targets = list(dict.fromkeys([book_deck, deck_prefix] + target_decks))
+        anki_request(url, "setDeckConfigId", decks=all_targets, configId=int(config_id))
+        return {
+            "source_deck": source_deck,
+            "preset_id": int(config_id),
+            "preset_name": chosen_cfg.get("name", "Default"),
+            "applied_to_decks": len(all_targets),
+        }
+    except Exception:
+        return None
+
+
 def sync_chapter_to_anki(
     workspace_root: Path,
     cfg: dict[str, Any],
@@ -933,6 +974,7 @@ def sync_chapter_to_anki(
     }
 
     anki_request(url, "createDeck", deck=deck_prefix)
+    synced_subdecks: list[str] = []
 
     kept_cards: list[dict[str, Any]] = []
     for c in cards:
@@ -968,7 +1010,9 @@ def sync_chapter_to_anki(
         # Handle Active Cards
         subdeck = c.get("subdeck") or f"Section {c.get('section', '1.1')}"
         full_deck_name = f"{deck_prefix}::{subdeck}"
-        anki_request(url, "createDeck", deck=full_deck_name)
+        if full_deck_name not in synced_subdecks:
+            anki_request(url, "createDeck", deck=full_deck_name)
+            synced_subdecks.append(full_deck_name)
 
         anki_front = c.get("anki_front") or ""
         anki_back = c.get("anki_back") or ""
@@ -1060,6 +1104,9 @@ def sync_chapter_to_anki(
 
         kept_cards.append(c)
 
+    deck_root = cfg.get("anki_deck_root", "Textbooks")
+    preset_info = propagate_parent_deck_config(url, deck_root, deck_prefix, synced_subdecks)
+
     ledger["cards"] = kept_cards
     ledger["last_synced"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     ledger_path.write_text(json.dumps(ledger, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1068,6 +1115,7 @@ def sync_chapter_to_anki(
         "anki_connected": True,
         "ledger_path": str(ledger_path.resolve()),
         "deck_prefix": deck_prefix,
+        "deck_preset": preset_info,
         "stats": stats,
         "media_uploaded": uploaded_media,
         "total_active_cards": sum(1 for c in kept_cards if c.get("status", "active") == "active"),
