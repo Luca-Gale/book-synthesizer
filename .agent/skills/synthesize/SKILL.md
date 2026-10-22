@@ -97,6 +97,10 @@ tags:
   - Format inline math as `$inline$` (no spaces immediately inside the `$` delimiters).
   - Always ensure there is a space BEFORE the opening `$` and AFTER the closing `$` when adjacent to surrounding words, parentheses, or markdown bold/italic formatting.
   - Format display math blocks with `$$` on dedicated lines separated by blank lines.
+  - **Display Math inside Callouts (`> [!tip]`, `> [!warning]`, etc.)**:
+    - Every line inside a callout MUST maintain the blockquote prefix `> ` (including blank lines, the opening `> $$`, the equation lines `> equation`, and the closing `> $$`).
+    - **Never** leave an empty line without `>` or a bare `$$` without `>` inside a callout—doing so abruptly terminates the callout box and breaks the layout.
+    - **Never** write `>` as part of the equation body—prefix each line with `> ` at the start of the line so Obsidian's Markdown parser strips the `>` before handing the clean LaTeX to MathJax/KaTeX.
 
 ---
 

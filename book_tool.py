@@ -1327,10 +1327,30 @@ def sanitize_mathjax(markdown_text: str) -> str:
     text = re.sub(r"`[^`\n]+?`", save_code, text)
 
     def format_display_math(m: re.Match[str]) -> str:
-        inner = m.group(1).strip()
-        return f"\n\n$$\n{inner}\n$$\n\n"
+        bq_start = m.group(1) or ""
+        inner = m.group(2)
+        bq_end = m.group(3) or ""
 
-    text = re.sub(r"(?<!\\)\$\$([\s\S]*?)(?<!\\)\$\$", format_display_math, text)
+        has_bq = (
+            bq_start.strip().startswith(">")
+            or bq_end.strip().startswith(">")
+            or any(line.strip().startswith(">") for line in inner.split("\n"))
+        )
+        if has_bq:
+            prefix = bq_start if bq_start.strip().startswith(">") else (bq_end if bq_end.strip().startswith(">") else "> ")
+            if not prefix.endswith(" "):
+                prefix += " "
+            clean_lines = [re.sub(r"^[ \t]*>[ \t]*", "", l) for l in inner.split("\n")]
+            clean_inner = "\n".join(clean_lines).strip()
+            lines = [f"{prefix}{l}" if l.strip() else prefix.rstrip() for l in clean_inner.split("\n")]
+            formatted = "\n".join(lines)
+            return f"\n{prefix.rstrip()}\n{prefix}$$\n{formatted}\n{prefix}$$\n{prefix.rstrip()}\n"
+        else:
+            clean_inner = inner.strip()
+            return f"\n\n$$\n{clean_inner}\n$$\n\n"
+
+    text = re.sub(r"(?m)^([ \t]*(?:>[ \t]*)+)?\$\$([\s\S]*?)^([ \t]*(?:>[ \t]*)+)?\$\$", format_display_math, text)
+    text = re.sub(r"\n(?:>[ \t]*\n){2,}", "\n>\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
 
     display_tokens: list[str] = []
