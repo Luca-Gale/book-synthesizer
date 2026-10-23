@@ -651,11 +651,38 @@ def aggregate_chapter_cards(
 
     clean_book_title = re.sub(r"\s+", " ", sanitize_filename(book_name).replace("_", " ")).strip()
     deck_root = cfg.get("anki_deck_root", "Textbooks")
+
+    # Check if sibling chapter ledgers already established a book deck prefix
+    existing_book_prefix: str | None = None
+    decks_book_dir = ledger_path.parent
+    if decks_book_dir.exists():
+        for sibling_ledger in sorted(decks_book_dir.glob("ch_*_cards.json")):
+            if sibling_ledger.resolve() == ledger_path.resolve():
+                continue
+            try:
+                s_data = json.loads(sibling_ledger.read_text(encoding="utf-8"))
+                p = s_data.get("deck_prefix")
+                if p:
+                    parts = p.split("::")
+                    if len(parts) >= 2:
+                        existing_book_prefix = "::".join(parts[:2])
+                        break
+            except Exception:
+                pass
+
+    book_prefix = existing_book_prefix or f"{deck_root}::{clean_book_title}"
+    default_deck_prefix = f"{book_prefix}::Chapter {int(ch_num):02d}"
+
     if ledger_path.exists():
         ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-        deck_prefix = ledger.get("deck_prefix") or f"{deck_root}::{clean_book_title}::Chapter {int(ch_num):02d}"
+        deck_prefix = ledger.get("deck_prefix") or default_deck_prefix
+        # If ledger had a stale deck prefix differing only in whitespace from sibling ledger, align it
+        if existing_book_prefix and not deck_prefix.startswith(existing_book_prefix):
+            parts = deck_prefix.split("::")
+            if len(parts) >= 3 and parts[-1].startswith("Chapter"):
+                deck_prefix = f"{existing_book_prefix}::{parts[-1]}"
     else:
-        deck_prefix = f"{deck_root}::{clean_book_title}::Chapter {int(ch_num):02d}"
+        deck_prefix = default_deck_prefix
         ledger = {
             "book": book_name,
             "book_slug": book_slug,
@@ -1206,6 +1233,7 @@ def cmd_prepare(workspace_root: Path, cfg: dict[str, Any], args: argparse.Namesp
     (ch_vault_dir / "assets").mkdir(parents=True, exist_ok=True)
 
     ledger_path = get_deck_ledger_path(workspace_root, cfg, book_slug, ch_num)
+    assets_manifest_path = cache_ch_dir / "assets_manifest.json"
 
     for sec in parsed["sections"]:
         sec_num = sec["section_number"]
@@ -1216,6 +1244,12 @@ def cmd_prepare(workspace_root: Path, cfg: dict[str, Any], args: argparse.Namesp
         sec["cards_scratch_path"] = str(
             (cache_ch_dir / f"cards_{sec_num.replace('.', '_')}.json").resolve()
         )
+        s_start = int(sec.get("start_pdf_page", parsed["start_pdf_page"]))
+        s_end = int(sec.get("end_pdf_page", s_start))
+        sec["page_pngs"] = [
+            str((pages_dir / f"pdf_page_{p:04d}.png").resolve())
+            for p in range(s_start, s_end + 1)
+        ]
 
     manifest = {
         "book_name": book_name,
@@ -1229,6 +1263,7 @@ def cmd_prepare(workspace_root: Path, cfg: dict[str, Any], args: argparse.Namesp
         "end_pdf_page": parsed["end_pdf_page"],
         "vault_chapter_dir": str(ch_vault_dir.resolve()),
         "assets_dir": str((ch_vault_dir / "assets").resolve()),
+        "assets_manifest_path": str(assets_manifest_path.resolve()),
         "deck_ledger_path": str(ledger_path.resolve()),
         "cache_chapter_dir": str(cache_ch_dir.resolve()),
         "cache_pages_dir": str(pages_dir.resolve()),
@@ -1307,11 +1342,40 @@ def cmd_crop(workspace_root: Path, cfg: dict[str, Any], args: argparse.Namespace
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cropped.save(str(out_path))
 
+    sec_match = re.match(r"^fig_(\d+)_(\d+)_", out_path.name)
+    inferred_section = f"{sec_match.group(1)}.{sec_match.group(2)}" if sec_match else None
+
+    assets_manifest_path = cache_ch_dir / "assets_manifest.json"
+    assets_data: dict[str, Any] = {"assets": []}
+    if assets_manifest_path.exists():
+        try:
+            assets_data = json.loads(assets_manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            assets_data = {"assets": []}
+
+    entry = {
+        "filename": out_path.name,
+        "section": inferred_section,
+        "obsidian_embed": f"![[assets/{out_path.name}]]",
+        "source_pdf_page": page_num,
+        "bbox": args.bbox,
+        "pixel_box": [left, top, right, bottom],
+        "cropped_image_path": str(out_path.resolve()),
+    }
+    existing_list = [
+        a for a in assets_data.get("assets", []) if a.get("filename") != out_path.name
+    ]
+    existing_list.append(entry)
+    assets_data["assets"] = existing_list
+    assets_manifest_path.write_text(json.dumps(assets_data, indent=2), encoding="utf-8")
+
     result = {
         "cropped_image_path": str(out_path.resolve()),
         "obsidian_embed": f"![[assets/{out_path.name}]]",
+        "section": inferred_section,
         "source_pdf_page": page_num,
         "pixel_box": [left, top, right, bottom],
+        "assets_manifest_path": str(assets_manifest_path.resolve()),
     }
     print(json.dumps(result, indent=2))
 
@@ -1344,13 +1408,47 @@ def sanitize_mathjax(markdown_text: str) -> str:
             clean_inner = "\n".join(clean_lines).strip()
             lines = [f"{prefix}{l}" if l.strip() else prefix.rstrip() for l in clean_inner.split("\n")]
             formatted = "\n".join(lines)
-            return f"\n{prefix.rstrip()}\n{prefix}$$\n{formatted}\n{prefix}$$\n{prefix.rstrip()}\n"
+            return f"{prefix.rstrip()}\n{prefix}$$\n{formatted}\n{prefix}$$\n{prefix.rstrip()}"
         else:
             clean_inner = inner.strip()
             return f"\n\n$$\n{clean_inner}\n$$\n\n"
 
     text = re.sub(r"(?m)^([ \t]*(?:>[ \t]*)+)?\$\$([\s\S]*?)^([ \t]*(?:>[ \t]*)+)?\$\$", format_display_math, text)
-    text = re.sub(r"\n(?:>[ \t]*\n){2,}", "\n>\n", text)
+
+    # Ensure any callouts / blockquotes never contain unquoted bare empty lines
+    lines = text.split("\n")
+    fixed_lines: list[str] = []
+    in_callout = False
+    for idx, l in enumerate(lines):
+        if re.match(r"^[ \t]*>[ \t]*\[!", l):
+            in_callout = True
+            fixed_lines.append(l)
+        elif in_callout:
+            if l.strip() == "":
+                # Peek ahead to check if this is within the same callout
+                next_l = ""
+                for k in range(idx + 1, len(lines)):
+                    if lines[k].strip() != "":
+                        next_l = lines[k]
+                        break
+                if next_l.strip().startswith(">"):
+                    if re.match(r"^[ \t]*>[ \t]*\[!", next_l):
+                        in_callout = False
+                        fixed_lines.append(l)
+                    else:
+                        fixed_lines.append(">")
+                else:
+                    in_callout = False
+                    fixed_lines.append(l)
+            elif not l.strip().startswith(">"):
+                in_callout = False
+                fixed_lines.append(l)
+            else:
+                fixed_lines.append(l)
+        else:
+            fixed_lines.append(l)
+    text = "\n".join(fixed_lines)
+    text = re.sub(r"(?m)^>[ \t]*\n(?:>[ \t]*\n)+", ">\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
 
     display_tokens: list[str] = []
@@ -1541,9 +1639,15 @@ tags:
 
     moc_path.write_text(moc_content, encoding="utf-8")
 
-    anki_sync_report = sync_chapter_to_anki(
-        workspace_root, cfg, book_name, ch_num
-    )
+    if getattr(args, "notes_only", False):
+        anki_sync_report: dict[str, Any] = {
+            "skipped": True,
+            "reason": "--notes-only flag passed; Anki flashcard sync bypassed.",
+        }
+    else:
+        anki_sync_report = sync_chapter_to_anki(
+            workspace_root, cfg, book_name, ch_num
+        )
 
     summary = {
         "moc_path": str(moc_path.resolve()),
@@ -1577,6 +1681,14 @@ def cmd_refresh_cards(workspace_root: Path, cfg: dict[str, Any], args: argparse.
     book_name = pdf_path.stem
     book_slug = slugify(book_name)
 
+    cache_ch_dir = (workspace_root / cfg["cache_dir"] / book_slug / f"ch_{int(ch_num):02d}").resolve()
+    cache_ch_dir.mkdir(parents=True, exist_ok=True)
+    pages_dir = cache_ch_dir / "pages"
+    manifest_path = cache_ch_dir / "manifest.json"
+    manifest: dict[str, Any] = {}
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
     vault_root = (workspace_root / cfg["vault_dir"]).resolve()
     clean_book = sanitize_filename(book_name)
     book_vault_dir = vault_root / clean_book
@@ -1586,23 +1698,38 @@ def cmd_refresh_cards(workspace_root: Path, cfg: dict[str, Any], args: argparse.
         if book_vault_dir.exists()
         else []
     )
-    if not ch_dirs:
+    if ch_dirs:
+        ch_vault_dir = ch_dirs[0]
+    elif manifest.get("vault_chapter_dir"):
+        ch_vault_dir = Path(manifest["vault_chapter_dir"])
+    else:
         raise FileNotFoundError(
-            f"No existing synthesized vault folder found for Chapter {ch_num} in '{book_vault_dir}'. "
-            "Run `/synthesize` first to create the Obsidian chapter notes."
+            f"No existing synthesized vault folder or manifest found for Chapter {ch_num}. "
+            "Run `python book_tool.py prepare` or `/synthesize` first."
         )
-    ch_vault_dir = ch_dirs[0]
+
     assets_dir = ch_vault_dir / "assets"
     available_assets = sorted(p.name for p in assets_dir.glob("*.png")) if assets_dir.exists() else []
 
-    cache_ch_dir = (workspace_root / cfg["cache_dir"] / book_slug / f"ch_{int(ch_num):02d}").resolve()
-    cache_ch_dir.mkdir(parents=True, exist_ok=True)
+    assets_manifest_path = cache_ch_dir / "assets_manifest.json"
+    manifest_assets_list: list[dict[str, Any]] = []
+    if assets_manifest_path.exists():
+        try:
+            manifest_assets_list = json.loads(assets_manifest_path.read_text(encoding="utf-8")).get("assets", [])
+        except Exception:
+            manifest_assets_list = []
 
     ledger_path = get_deck_ledger_path(workspace_root, cfg, book_slug, ch_num)
     existing_cards: list[dict[str, Any]] = []
     if ledger_path.exists():
         ledger_data = json.loads(ledger_path.read_text(encoding="utf-8"))
         existing_cards = ledger_data.get("cards", [])
+
+    manifest_sections_by_num: dict[str, dict[str, Any]] = {
+        str(s.get("section_number")): s
+        for s in manifest.get("sections", [])
+        if s.get("section_number")
+    }
 
     sec_files = sorted(
         [
@@ -1626,6 +1753,45 @@ def cmd_refresh_cards(workspace_root: Path, cfg: dict[str, Any], args: argparse.
         if args.section and sec_num != args.section:
             continue
 
+        m_sec = manifest_sections_by_num.get(sec_num, {})
+        s_start = m_sec.get("start_pdf_page")
+        s_end = m_sec.get("end_pdf_page")
+        page_pngs: list[str] = []
+        if s_start is not None and s_end is not None:
+            page_pngs = [
+                str((pages_dir / f"pdf_page_{p:04d}.png").resolve())
+                for p in range(int(s_start), int(s_end) + 1)
+            ]
+
+        sec_prefix = f"fig_{sec_num.replace('.', '_')}_"
+        note_embeds: set[str] = set()
+        if note_path.exists():
+            note_text = note_path.read_text(encoding="utf-8")
+            for emb_m in re.finditer(r"!\[\[(?:assets/)?([^\]|]+)\]\]", note_text):
+                note_embeds.add(Path(emb_m.group(1).strip()).name)
+
+        sec_assets = sorted(
+            {
+                a
+                for a in available_assets
+                if a.startswith(sec_prefix) or a in note_embeds
+            }
+            | {
+                str(entry.get("filename"))
+                for entry in manifest_assets_list
+                if entry.get("filename")
+                and (
+                    entry.get("section") == sec_num
+                    or (
+                        s_start is not None
+                        and s_end is not None
+                        and entry.get("source_pdf_page") is not None
+                        and int(s_start) <= int(entry["source_pdf_page"]) <= int(s_end)
+                    )
+                )
+            }
+        )
+
         sec_existing_cards = [
             {
                 "id": c.get("id"),
@@ -1644,7 +1810,11 @@ def cmd_refresh_cards(workspace_root: Path, cfg: dict[str, Any], args: argparse.
         sections_info.append(
             {
                 "section_number": sec_num,
-                "section_title": sec_title,
+                "section_title": m_sec.get("title") or sec_title,
+                "start_pdf_page": s_start,
+                "end_pdf_page": s_end,
+                "page_pngs": page_pngs,
+                "section_assets": sec_assets,
                 "note_path": str(note_path.resolve()),
                 "cards_scratch_path": str(
                     (cache_ch_dir / f"cards_{sec_num.replace('.', '_')}.json").resolve()
@@ -1660,6 +1830,7 @@ def cmd_refresh_cards(workspace_root: Path, cfg: dict[str, Any], args: argparse.
         "chapter_number": ch_num,
         "vault_chapter_dir": str(ch_vault_dir.resolve()),
         "assets_dir": str(assets_dir.resolve()),
+        "assets_manifest_path": str(assets_manifest_path.resolve()),
         "available_assets": available_assets,
         "deck_ledger_path": str(ledger_path.resolve()),
         "anki_connected": check_anki_connection(cfg.get("anki_connect_url", "http://127.0.0.1:8765")),
@@ -1693,6 +1864,11 @@ def main() -> None:
 
     p_fin = sub.add_parser("finalize", help="Sanitize MathJax, inject [[Prev]]/[[Next]] links, build MOC, & sync Anki")
     p_fin.add_argument("--chapter", type=str, default=None, help="Override chapter number")
+    p_fin.add_argument(
+        "--notes-only",
+        action="store_true",
+        help="Finalize Obsidian notes and MOC only, skipping Anki card aggregation and sync",
+    )
 
     p_sync = sub.add_parser("sync-anki", help="Aggregate section flashcards into ./decks/ and sync via AnkiConnect")
     p_sync.add_argument("--chapter", type=str, default=None, help="Override chapter number")
@@ -1702,7 +1878,8 @@ def main() -> None:
 
     p_ref = sub.add_parser(
         "refresh-cards",
-        help="Inspect existing Obsidian section notes & card ledger to refresh flashcards without re-synthesizing notes",
+        aliases=["cards"],
+        help="Inspect 300-DPI section page PNGs, cropped assets & card ledger for standalone flashcard extraction/tuning",
     )
     p_ref.add_argument("--chapter", type=str, default=None, help="Override chapter number")
     p_ref.add_argument("--section", type=str, default=None, help="Target a single section (e.g. 1.3)")
@@ -1718,7 +1895,7 @@ def main() -> None:
         cmd_finalize(workspace_root, cfg, args)
     elif args.command == "sync-anki":
         cmd_sync_anki(workspace_root, cfg, args)
-    elif args.command == "refresh-cards":
+    elif args.command in ("refresh-cards", "cards"):
         cmd_refresh_cards(workspace_root, cfg, args)
 
 
