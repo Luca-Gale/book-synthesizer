@@ -40,9 +40,9 @@ An **Antigravity-native** workflow and deterministic Python toolkit that transfo
 3. **Ask Antigravity in chat**:
    > `Synthesize the chapter` *(or invoke `/synthesize`)*
 
-### 2. Refresh or Edit Flashcards Independently
-Without re-synthesizing your Obsidian reading notes, you can ask in chat:
-- *"Generate/refresh Anki flashcards for Chapter 1"*
+### 2. Generate, Refresh, or Fine-Tune Flashcards Independently (`/flashcards`)
+Flashcard generation is strictly decoupled into [`.agent/skills/flashcards/SKILL.md`](./.agent/skills/flashcards/SKILL.md) (`SectionFlashcardExtractor`), which reads the raw 300-DPI textbook pages directly across a **5-Pillar Extraction Taxonomy**. Without re-synthesizing your Obsidian reading notes, you can invoke `/flashcards` or ask in chat:
+- *"Run `/flashcards` for Chapter 1"*
 - *"Refresh flashcards for section 1.3"*
 - *"Add 3 flashcards on the projection theorem in section 1.3"*
 
@@ -54,7 +54,9 @@ Without re-synthesizing your Obsidian reading notes, you can ask in chat:
 book-synthesizer/
 ├── .agent/
 │   └── skills/
-│       └── synthesize/        # Antigravity synthesis & Anki workflow skill
+│       ├── synthesize/        # Stage A: SectionNoteSynthesizer & Pipeline Orchestrator
+│       │   └── SKILL.md
+│       └── flashcards/        # Stage B: Standalone SectionFlashcardExtractor (5-Pillar Taxonomy)
 │           └── SKILL.md
 ├── book/                      # Active textbook PDF directory (ignored in git)
 ├── vault/                     # Ready-to-open Obsidian vault (clean reading notes)
@@ -98,7 +100,7 @@ python book_tool.py crop --page <pdf_page_num> --bbox "<ymin>,<xmin>,<ymax>,<xma
 
 ### 4. Finalize Chapter Notes, Build MOC & Sync Anki
 ```bash
-python book_tool.py finalize [--chapter N]
+python book_tool.py finalize [--chapter N] [--notes-only]
 ```
 
 ### 5. Sync Flashcards to AnkiConnect
@@ -107,8 +109,10 @@ Aggregates section flashcards into `decks/<book_slug>/ch_XX_cards.json` and sync
 python book_tool.py sync-anki [--chapter N] [--section X.Y] [--force] [--prune]
 ```
 
-### 6. Inspect Existing Notes to Refresh Flashcards
-Inspects existing synthesized Obsidian notes and current deck ledgers without re-rendering PDF pages:
+### 6. Inspect Raw Page PNGs, Cropped Assets & Card Ledger for Flashcards
+Exposes the 300-DPI section page PNGs, cropped figure assets, and current deck ledger for standalone flashcard extraction:
 ```bash
 python book_tool.py refresh-cards [--chapter N] [--section X.Y]
+# or alias:
+python book_tool.py cards [--chapter N] [--section X.Y]
 ```

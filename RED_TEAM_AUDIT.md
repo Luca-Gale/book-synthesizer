@@ -1,63 +1,52 @@
-# Red-Team Architectural Audit Log: Book-Synthesizer AnkiConnect Integration
+# Red-Team Architectural Audit Log: Decoupled Book-Synthesizer & Exhaustive Flashcard Engine
 
-- **Date**: 2026-10-20
+- **Date**: 2026-10-22
 - **Companion Spec**: [TECH_SPEC.md](./TECH_SPEC.md)
 
 ---
 
 ## 1. Executive Summary
-The user requested adding automated **Anki flashcard generation and sync** to the existing textbook synthesizer workflow, specifically using **AnkiConnect** so cards can be iteratively added, updated, and refined without wiping review history.
+The architecture evolved from a single monolithic `/synthesize` skill—where one section subagent wrote both the Obsidian Pre-Reading Primer note and the Anki flashcards simultaneously—into a **strictly decoupled two-agent pipeline**:
+1. **`SectionNoteSynthesizer` ([`.agent/skills/synthesize/SKILL.md`](./.agent/skills/synthesize/SKILL.md))**: Dedicated exclusively to pedagogical narrative, step-by-step mathematical derivations, symbol glossaries, and cropping textbook diagrams.
+2. **`SectionFlashcardExtractor` ([`.agent/skills/flashcards/SKILL.md`](./.agent/skills/flashcards/SKILL.md))**: Dedicated exclusively to exhaustive, atomic active-recall extraction directly from the 300-DPI textbook page PNGs, governed by a 5-Pillar Extraction Taxonomy and backed by a shared cropped-figure asset manifest.
 
-The 🔴 Red Team audited the initial design, uncovering 4 key failure modes:
-1. Two-way distributed state inconsistency if user cards were stored loosely.
-2. Anki note model mutation crashes (`Basic` $\leftrightarrow$ `Cloze` cannot be updated in-place via `updateNoteFields`).
-3. SQLite database locking and file race conditions caused by parallel section subagents calling AnkiConnect concurrently.
-4. Review queue clutter from orphaned cards upon chapter re-synthesis.
-
-Following a 2-round debate and the user's executive rulings in the Cross-Examination Chamber, the architecture was solidified around **strict separation of concerns** (clean notes in Obsidian, flashcards in Anki) with single-threaded safe synchronization, non-destructive auto-suspension for orphaned cards, and independent card refresh without full chapter re-synthesis.
+This separation allows the user to fine-tune flashcard generation rules, density, and phrasing independently without risking regressions in Obsidian note synthesis (and vice versa), while ensuring flashcards extract 100% of the source textbook's notions rather than summarizing an already-condensed note.
 
 ---
 
 ## 2. Concessions & Adopted Improvements
+Architectural changes proposed by the 🔴 Red Team that the 🔵 Blue Team accepted during Rounds 1 & 2:
 
-| Area / Component | Initial Proposal | Red Team Critique | Adopted Solution |
+| Area / Component | Initial v1 Proposal (Blue) | Red Team Critique | Adopted Solution |
 | :--- | :--- | :--- | :--- |
-| **Concurrency & Sync Timing** | Subagents push cards directly to AnkiConnect. | Concurrent subagent HTTP calls cause Windows file-lock errors and Anki SQLite `"database is locked"` errors. | **Single-Threaded Finalize**: Subagents write section cards to isolated `.cache/ch_XX/cards_X_Y.json` files; single-threaded `finalize` step merges and pushes to AnkiConnect sequentially. |
-| **Note Model Mutation** | In-place updates via `updateNoteFields` regardless of card type. | AnkiConnect throws an exception if trying to update fields across different models (`Basic` vs `Cloze`). | **Model Replacement Protocol**: If model changes, the engine creates the new note and suspends/retires the old note. |
-| **MathJax Translation** | Global regex replace of `$` with `\(` and `$$` with `\[`. | Breaks escaped literal dollars (`\$`), inline code blocks, and LaTeX tabular environments. | **Token-Aware Math Parser**: Converts math blocks while respecting code blocks and escaped characters. |
-| **Orphan Management** | Untracked or passive tagging. | Re-synthesizing chapters pollutes the user's active review queue with ghost cards. | **Auto-Suspension**: Replaced/superseded cards are tagged `book_synthesizer::orphaned` and auto-suspended in Anki; optional `--prune` flag for hard deletion. |
-| **Card Refresh Granularity** | Full chapter re-synthesis required to refresh cards. | High compute overhead and risk of re-writing finalized Obsidian reading notes just to tweak flashcards. | **Decoupled Refresh**: Added `refresh-cards` subcommand that reads existing Obsidian primer notes and extracts/updates cards without re-running PDF extraction. |
+| **Diagram & Figure Sharing (`assets_manifest.json`)** | `SectionNoteSynthesizer` crops figures into `vault/.../assets/`, while `SectionFlashcardExtractor` runs isolated on raw PDF pages. | **The "Orphan Crop" Dilemma**: If the Flashcard Agent runs decoupled on raw pages, it either lacks access to cropped diagram filenames or duplicates cropping work with conflicting filenames. | `book_tool.py crop` automatically records every cropped figure into `.cache/<book>/ch_XX/assets_manifest.json`, and `refresh-cards` exposes `section_assets` alongside `page_pngs`. `SectionFlashcardExtractor` reuses existing crops and has fallback `crop` access if an uncropped figure is needed. |
+| **Exhaustive Extraction vs. Anki Bloat** | Unbounded prompt instruction: *"Extract literally everything from the section; over-generation is welcomed."* | **The Anki Bloat & Suspension Fatigue Trap**: Unbounded LLM extraction produces trivial semantic fluff and multi-clause cards, forcing exhausting manual suspension in Anki. | Adopted the **5-Pillar Flashcard Extraction Taxonomy** (1. Formal Definitions, 2. Governing Equations/Derivations, 3. Explicit/Implicit Assumptions, 4. Physical/Geometric Intuition, 5. Diagram Interpretation) + strict **Minimum Information Principle** (1 atomic fact per card). |
+| **Independent Note Re-Finalization (`--notes-only`)** | `book_tool.py finalize` always triggered both Obsidian MOC generation and AnkiConnect deck syncing. | Tuning the note synthesizer alone would still trigger Anki aggregation and syncing. | Added `--notes-only` flag to `book_tool.py finalize` so Obsidian notes and MOC links can be rebuilt completely independently of Anki. |
 
 ---
 
 ## 3. Defended Decisions
+Challenges raised by the 🔴 Red Team that were successfully defended and kept as originally designed:
 
-- **Local JSON Deck Ledger (`vault/decks/ch_XX_cards.json`)**:
-  - *Challenged by Red Team*: Red argued that querying Anki directly via `findNotes` eliminates the local file.
-  - *Defended Rationale*: AnkiConnect is only available when Anki desktop is open on localhost. If the user synthesizes a chapter offline or with Anki closed, an Anki-only query completely halts synthesis. The local ledger acts as a safe, offline-first staging queue.
-- **No Automatic Hard Deletions**:
-  - *Challenged by Red Team*: Red warned about accumulating ghost cards.
-  - *Defended Rationale*: In spaced repetition, losing card IDs destroys months of calculated intervals, stability, and ease factors. Auto-suspension protects user investment while keeping daily reviews clean.
+- **Direct-from-PDF Multimodal Reading by `SectionFlashcardExtractor`**:
+  - *Challenge*: Red Team argued that having both `SectionNoteSynthesizer` and `SectionFlashcardExtractor` read the 300-DPI page PNGs incurs a "Double Vision" token cost and could risk terminology drift compared to reading the synthesized Markdown note.
+  - *Defense*: The user's long-term study workflow relies almost exclusively on Anki flashcards after the initial chapter reading, making flashcards the #1 priority artifact. Feeding the Obsidian note as the primary source would turn flashcards into a lossy summary of a summary. Reading the 300-DPI textbook pages directly guarantees zero omitted equations, sidebars, or subtle assumptions, while verbatim textbook nomenclature prevents drift.
 
 ---
 
 ## 4. Cross-Examination & User Executive Rulings
+Deadlocks that went to the **Cross-Examination Chamber** and how the user ruled:
 
-### Fork 1: Flashcard Storage Location (JSON Ledger vs. Markdown Deck in Vault)
-- **🔵 Blue Team Stance**: Keep flashcards in a dedicated JSON ledger (`vault/decks/ch_XX_cards.json`). Keep reading notes in Obsidian 100% clean and distraction-free.
-- **🔴 Red Team Stance**: Store flashcards in a human-readable `Flashcards - Chapter XX.md` markdown file in Obsidian.
-- **⚖️ Final User Ruling**: **Blue's approach adopted**. *"Let's keep things separated: notes in Obsidian, flashcards in Anki."*
-
-### Fork 2: Orphaned Card Management (Silent Auto-Suspension vs. Interactive CLI Pruning)
-- **🔵 Blue Team Stance**: Automatically suspend superseded cards in Anki and add the tag `book_synthesizer::orphaned`. No interruptions, no permanent deletion.
-- **🔴 Red Team Stance**: Interactively prompt the user in terminal during sync: `[K]eep, [S]uspend, [D]elete`.
-- **⚖️ Final User Ruling**: **Blue's approach adopted**. Re-running synthesis on the same chapter will be rare; auto-suspension removes unwanted cards from daily reviews while allowing manual re-insertion in Anki if the user liked a specific card. Furthermore, the user requested the ability to refresh flashcards without having to re-synthesize the whole chapter.
+### Fork 1: Pipeline Coordination Between Note Synthesis and Flashcard Extraction
+- **🔵 Blue Team Stance (Pipelined Handoff)**: During a full `/synthesize` run, `SectionNoteSynthesizer` runs first (writing the note and cropping figures into `vault/.../assets/`), followed immediately by `SectionFlashcardExtractor` (which reads the raw PDF pages and embeds the already-cropped figures). Subsequent flashcard fine-tuning runs `SectionFlashcardExtractor` standalone via `/flashcards`.
+- **🔴 Red Team Stance (Standalone Parallel Workers)**: Decouple figure cropping into a separate daemon/pre-pass so flashcards could be generated for a new chapter before—or without ever—generating Obsidian primer notes.
+- **Key Insights from Cross-Examination**: The user pointed out that their real-world study sequence is strictly `Obsidian Priming Notes -> Textbook Deep Dive -> Long-Term Anki Reviews`. Since flashcards are never needed *before* the priming notes exist on initial synthesis, Red Team's concern about waiting for notes on initial run does not apply in practice.
+- **⚖️ Final User Ruling**: **Approach 1 (Pipelined Handoff with Shared Asset Manifest & Standalone `/flashcards` Re-Run)**. Both teams aligned on this ruling.
 
 ---
 
-## 5. Discard Pile (Rejected Alternatives)
+## 5. Deferred Ideas & Discard Pile
+Features, abstractions, or technologies explicitly rejected during red-teaming (so future development sessions do not accidentally re-introduce them):
 
-- **Embedding Flashcard Blocks inside Section Reading Notes**: Rejected to protect Obsidian notes as pure pre-reading primers without Q&A clutter.
-- **Direct Multi-threaded Calls to AnkiConnect**: Rejected due to SQLite database concurrency lockups.
-- **Silent Automated Note Deletion in Anki**: Rejected to prevent accidental loss of user review intervals and learning history.
-- **Interactive Blocking Terminal Prompts for Sync**: Rejected in favor of smooth, non-blocking auto-suspension.
+- **Note-Only Flashcard Extraction (Summarizing the Markdown Primer)**: Rejected because it degrades flashcard completeness and violates the requirement that nothing in the textbook should feel new after studying the deck.
+- **Separate Pre-Pass Figure Detection Agent**: Rejected as premature complexity given that `SectionNoteSynthesizer` already inspects every page prior to `SectionFlashcardExtractor` during initial chapter synthesis, and `SectionFlashcardExtractor` retains fallback `book_tool.py crop` capability.
