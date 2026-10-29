@@ -189,11 +189,32 @@ def parse_toc_for_chapter(
     }
 
 
+def normalize_heading_title(raw_title: str) -> str:
+    """Clean OCR letter-spaced headings ('S I M U L A T I O N') and ALL-CAPS section titles."""
+    t = " ".join(raw_title.split()).strip(" .…-")
+    # Clean trailing (*) or (*} from starred sections
+    t = re.sub(r"\s*\([*]\s*[)\}]\s*$", "", t).strip()
+    # Collapse runs of 3+ single-character uppercase/letter tokens separated by single spaces (e.g., "M O D E L S" -> "MODELS")
+    t = re.sub(
+        r"\b(?:[A-Za-z]\s+){2,}[A-Za-z]\b",
+        lambda m: m.group(0).replace(" ", ""),
+        t,
+    )
+    if t.isupper() and len(t) > 1:
+        minor_words = {"a", "an", "and", "as", "at", "by", "for", "from", "in", "into", "of", "on", "or", "the", "to", "with"}
+        words = t.title().split(" ")
+        t = " ".join(
+            w.lower() if (i > 0 and w.lower() in minor_words) else w
+            for i, w in enumerate(words)
+        )
+    return t
+
+
 def scan_text_for_chapter_sections(
     doc: Any, target_ch: str, skip_keywords: list[str]
 ) -> dict[str, Any]:
     sec_heading_re = re.compile(
-        rf"(?m)^\s*({re.escape(target_ch)}\.[1-9]\d*)\s+([A-Z][^\n\r{{}}0-9]{{2,90}}?)(?:\s+(\d{{1,4}}))?\s*$"
+        rf"(?m)^\s*({re.escape(target_ch)}\.[1-9]\d*)\s+([A-Z][^\n\r{{}}0-9]{{2,90}}?)(?:\s+(\d{{1,4}}))?\s*(?:\r?\n\s*([A-Z][A-Z\s,:\-\(\)\*\}}]{{2,60}}))?\s*$"
     )
     toc_pages: list[int] = []
     section_hits: dict[str, dict[str, Any]] = {}
@@ -202,11 +223,18 @@ def scan_text_for_chapter_sections(
         text = doc[page_idx].get_text("text")
         if re.search(r"\b(contents|table of contents)\b", text, re.IGNORECASE) and page_idx < 30:
             toc_pages.append(page_idx + 1)
+            continue
+        # Skip front-matter ToC continuation pages (typically pages 1..20 of textbook PDFs)
+        if toc_pages and page_idx < max(toc_pages) + 8 and page_idx < 22:
+            continue
 
         for match in sec_heading_re.finditer(text):
             sec_num = match.group(1)
-            sec_title = " ".join(match.group(2).split()).strip(" .…-")
+            raw_line1 = match.group(2)
             trailing_page = match.group(3)
+            raw_line2 = (match.group(4) or "").strip()
+            combined_raw = f"{raw_line1} {raw_line2}".strip() if raw_line2 and raw_line2.isupper() else raw_line1
+            sec_title = normalize_heading_title(combined_raw)
             if not trailing_page and sec_num not in section_hits:
                 section_hits[sec_num] = {
                     "section_number": sec_num,
@@ -277,11 +305,7 @@ def get_vault_chapter_dir(
 ) -> Path:
     vault_root = (workspace_root / cfg["vault_dir"]).resolve()
     clean_book = sanitize_filename(book_name)
-    clean_ch_title = sanitize_filename(ch_title)
-    if clean_ch_title.lower() == f"chapter {ch_num}".lower():
-        folder_name = f"Chapter {int(ch_num):02d}"
-    else:
-        folder_name = f"Chapter {int(ch_num):02d} - {clean_ch_title}"
+    folder_name = f"Chapter {int(ch_num):02d}"
     return vault_root / clean_book / folder_name
 
 
@@ -978,18 +1002,39 @@ def sync_chapter_to_anki(
                 )
                 uploaded_media.append(anki_fname)
 
-    # 2. Query existing notesInfo for all known anki_note_ids
+    # 2. Query existing notesInfo for all known anki_note_ids + any chapter-tagged notes in Anki
     known_ids = [
         int(c["anki_note_id"])
         for c in cards
         if c.get("anki_note_id") is not None
     ]
+    chapter_tag = f"chapter-{int(ch_num):02d}"
+    chapter_note_ids: list[int] = [
+        int(nid) for nid in (anki_request(url, "findNotes", query=f"tag:{chapter_tag}") or [])
+    ]
+    all_lookup_ids = list(dict.fromkeys(known_ids + chapter_note_ids))
     existing_notes_by_id: dict[int, dict[str, Any]] = {}
-    if known_ids:
-        notes_info = anki_request(url, "notesInfo", notes=known_ids) or []
+    if all_lookup_ids:
+        notes_info = anki_request(url, "notesInfo", notes=all_lookup_ids) or []
         for ni in notes_info:
             if ni and ni.get("noteId"):
                 existing_notes_by_id[int(ni["noteId"])] = ni
+
+    # Build lookup of untracked chapter notes in Anki (e.g. from a previously interrupted sync)
+    tracked_id_set = set(known_ids)
+    untracked_by_front: dict[str, list[int]] = {}
+    for nid in chapter_note_ids:
+        if nid in tracked_id_set:
+            continue
+        ni = existing_notes_by_id.get(nid)
+        if not ni:
+            continue
+        fields_dict = ni.get("fields") or {}
+        if not fields_dict:
+            continue
+        first_val = html.unescape(next(iter(fields_dict.values())).get("value", "")).strip()
+        if first_val:
+            untracked_by_front.setdefault(first_val, []).append(nid)
 
     stats = {
         "added": 0,
@@ -998,145 +1043,182 @@ def sync_chapter_to_anki(
         "suspended_orphans": 0,
         "pruned_orphans": 0,
         "model_migrations": 0,
+        "deduped_untracked": 0,
     }
 
     anki_request(url, "createDeck", deck=deck_prefix)
     synced_subdecks: list[str] = []
 
     kept_cards: list[dict[str, Any]] = []
-    for c in cards:
-        if section_filter and str(c.get("section")) != section_filter:
-            kept_cards.append(c)
-            continue
+    try:
+        for c in cards:
+            if section_filter and str(c.get("section")) != section_filter:
+                kept_cards.append(c)
+                continue
 
-        status = c.get("status", "active")
-        note_id = int(c["anki_note_id"]) if c.get("anki_note_id") is not None else None
-        existing_info = existing_notes_by_id.get(note_id) if note_id else None
+            status = c.get("status", "active")
+            note_id = int(c["anki_note_id"]) if c.get("anki_note_id") is not None else None
+            existing_info = existing_notes_by_id.get(note_id) if note_id else None
 
-        # Handle Orphaned Cards
-        if status == "orphaned":
-            if existing_info:
-                if prune:
-                    anki_request(url, "deleteNotes", notes=[note_id])
-                    stats["pruned_orphans"] += 1
-                    continue
-                elif not c.get("synced", False) or force:
-                    card_ids = existing_info.get("cards", [])
-                    if card_ids:
-                        anki_request(url, "suspend", cards=card_ids)
-                    anki_request(url, "addTags", notes=[note_id], tags=ORPHAN_TAG)
+            # Adopt untracked note with identical front if this card lost its anki_note_id
+            if existing_info is None and status == "active":
+                norm_front = html.unescape(c.get("anki_front") or "").strip()
+                candidates = untracked_by_front.get(norm_front) or []
+                if candidates:
+                    adopted_id = candidates.pop(0)
+                    note_id = adopted_id
+                    c["anki_note_id"] = adopted_id
+                    existing_info = existing_notes_by_id.get(adopted_id)
+                    tracked_id_set.add(adopted_id)
+
+            # Handle Orphaned Cards
+            if status == "orphaned":
+                if existing_info:
+                    if prune:
+                        anki_request(url, "deleteNotes", notes=[note_id])
+                        stats["pruned_orphans"] += 1
+                        continue
+                    elif not c.get("synced", False) or force:
+                        card_ids = existing_info.get("cards", [])
+                        if card_ids:
+                            anki_request(url, "suspend", cards=card_ids)
+                        anki_request(url, "addTags", notes=[note_id], tags=ORPHAN_TAG)
+                        c["synced"] = True
+                        stats["suspended_orphans"] += 1
+                else:
+                    if prune:
+                        continue
                     c["synced"] = True
-                    stats["suspended_orphans"] += 1
-            else:
-                if prune:
-                    continue
-                c["synced"] = True
-            kept_cards.append(c)
-            continue
+                kept_cards.append(c)
+                continue
 
-        # Handle Active Cards
-        subdeck = c.get("subdeck") or f"Section {c.get('section', '1.1')}"
-        full_deck_name = f"{deck_prefix}::{subdeck}"
-        if full_deck_name not in synced_subdecks:
-            anki_request(url, "createDeck", deck=full_deck_name)
-            synced_subdecks.append(full_deck_name)
+            # Handle Active Cards
+            subdeck = c.get("subdeck") or f"Section {c.get('section', '1.1')}"
+            full_deck_name = f"{deck_prefix}::{subdeck}"
+            if full_deck_name not in synced_subdecks:
+                anki_request(url, "createDeck", deck=full_deck_name)
+                synced_subdecks.append(full_deck_name)
 
-        anki_front = c.get("anki_front") or ""
-        anki_back = c.get("anki_back") or ""
-        logical_model = normalize_model_type(c.get("model_name", "Basic"), anki_front)
-        c["model_name"] = logical_model
-        model_spec = models_map[logical_model]
-        actual_model_name = model_spec["model_name"]
-        front_field = model_spec["front_field"]
-        back_field = model_spec["back_field"]
+            anki_front = c.get("anki_front") or ""
+            anki_back = c.get("anki_back") or ""
+            logical_model = normalize_model_type(c.get("model_name", "Basic"), anki_front)
+            c["model_name"] = logical_model
+            model_spec = models_map[logical_model]
+            actual_model_name = model_spec["model_name"]
+            front_field = model_spec["front_field"]
+            back_field = model_spec["back_field"]
 
-        tags = [t for t in c.get("tags", []) if t != ORPHAN_TAG]
-        c["tags"] = tags
-        new_hash = compute_card_hash(subdeck, logical_model, anki_front, anki_back, tags)
+            tags = [t for t in c.get("tags", []) if t != ORPHAN_TAG]
+            c["tags"] = tags
+            new_hash = compute_card_hash(subdeck, logical_model, anki_front, anki_back, tags)
 
-        # Check if note model changed
-        if existing_info is not None and existing_info.get("modelName") != actual_model_name:
-            old_card_ids = existing_info.get("cards", [])
-            if old_card_ids:
-                anki_request(url, "suspend", cards=old_card_ids)
-            anki_request(url, "addTags", notes=[note_id], tags=ORPHAN_TAG)
-            c.setdefault("previous_note_ids", []).append(note_id)
-            existing_info = None
-            note_id = None
-            stats["model_migrations"] += 1
-
-        # If an existing Cloze note previously had >1 sibling cards (e.g. from c2) and now only has c1,
-        # check if it has 0 reviews; if unreviewed, replace it cleanly so Anki doesn't keep an empty Carta 2!
-        if existing_info is not None and len(existing_info.get("cards", [])) > 1 and "{{c2::" not in anki_front:
-            c_infos = anki_request(url, "cardsInfo", cards=existing_info["cards"]) or []
-            total_reps = sum(int(ci.get("reps", 0)) for ci in c_infos)
-            if total_reps == 0:
-                anki_request(url, "deleteNotes", notes=[note_id])
+            # Check if note model changed
+            if existing_info is not None and existing_info.get("modelName") != actual_model_name:
+                old_card_ids = existing_info.get("cards", [])
+                if old_card_ids:
+                    anki_request(url, "suspend", cards=old_card_ids)
+                anki_request(url, "addTags", notes=[note_id], tags=ORPHAN_TAG)
+                c.setdefault("previous_note_ids", []).append(note_id)
                 existing_info = None
                 note_id = None
-            else:
-                # Suspend the extra sibling card(s) with ord > 0 so reviews on ord 0 are preserved
-                extra_cards = [int(ci["cardId"]) for ci in c_infos if int(ci.get("ord", 0)) > 0]
-                if extra_cards:
-                    anki_request(url, "suspend", cards=extra_cards)
+                stats["model_migrations"] += 1
 
-        if existing_info is None:
-            note_payload = {
-                "deckName": full_deck_name,
-                "modelName": actual_model_name,
-                "fields": {
-                    front_field: anki_front,
-                    back_field: anki_back,
-                },
-                "options": {
-                    "allowDuplicate": True,
-                },
-                "tags": tags,
-            }
-            new_note_id = anki_request(url, "addNote", note=note_payload)
-            c["anki_note_id"] = int(new_note_id)
-            c["anki_actual_model"] = actual_model_name
-            c["content_hash"] = new_hash
-            c["synced"] = True
-            stats["added"] += 1
-        else:
-            if c.get("content_hash") != new_hash or not c.get("synced", False) or force:
-                anki_request(
-                    url,
-                    "updateNoteFields",
-                    note={
-                        "id": note_id,
-                        "fields": {
-                            front_field: anki_front,
-                            back_field: anki_back,
-                        },
+            # If an existing Cloze note previously had >1 sibling cards (e.g. from c2) and now only has c1,
+            # check if it has 0 reviews; if unreviewed, replace it cleanly so Anki doesn't keep an empty Carta 2!
+            if existing_info is not None and len(existing_info.get("cards", [])) > 1 and "{{c2::" not in anki_front:
+                c_infos = anki_request(url, "cardsInfo", cards=existing_info["cards"]) or []
+                total_reps = sum(int(ci.get("reps", 0)) for ci in c_infos)
+                if total_reps == 0:
+                    anki_request(url, "deleteNotes", notes=[note_id])
+                    existing_info = None
+                    note_id = None
+                else:
+                    # Suspend the extra sibling card(s) with ord > 0 so reviews on ord 0 are preserved
+                    extra_cards = [int(ci["cardId"]) for ci in c_infos if int(ci.get("ord", 0)) > 0]
+                    if extra_cards:
+                        anki_request(url, "suspend", cards=extra_cards)
+
+            if existing_info is None:
+                note_payload = {
+                    "deckName": full_deck_name,
+                    "modelName": actual_model_name,
+                    "fields": {
+                        front_field: anki_front,
+                        back_field: anki_back,
                     },
-                )
-                card_ids = existing_info.get("cards", [])
-                if card_ids:
-                    anki_request(url, "changeDeck", cards=card_ids, deck=full_deck_name)
-                    if ORPHAN_TAG in (existing_info.get("tags") or []):
-                        anki_request(url, "unsuspend", cards=card_ids)
-                        anki_request(url, "removeTags", notes=[note_id], tags=ORPHAN_TAG)
-
-                if tags:
-                    anki_request(url, "addTags", notes=[note_id], tags=" ".join(tags))
-
+                    "options": {
+                        "allowDuplicate": True,
+                    },
+                    "tags": tags,
+                }
+                new_note_id = anki_request(url, "addNote", note=note_payload)
+                c["anki_note_id"] = int(new_note_id)
+                tracked_id_set.add(int(new_note_id))
                 c["anki_actual_model"] = actual_model_name
                 c["content_hash"] = new_hash
                 c["synced"] = True
-                stats["updated"] += 1
+                stats["added"] += 1
             else:
-                stats["unchanged"] += 1
+                if c.get("content_hash") != new_hash or not c.get("synced", False) or force:
+                    anki_request(
+                        url,
+                        "updateNoteFields",
+                        note={
+                            "id": note_id,
+                            "fields": {
+                                front_field: anki_front,
+                                back_field: anki_back,
+                            },
+                        },
+                    )
+                    card_ids = existing_info.get("cards", [])
+                    if card_ids:
+                        anki_request(url, "changeDeck", cards=card_ids, deck=full_deck_name)
+                        if ORPHAN_TAG in (existing_info.get("tags") or []):
+                            anki_request(url, "unsuspend", cards=card_ids)
+                            anki_request(url, "removeTags", notes=[note_id], tags=ORPHAN_TAG)
 
-        kept_cards.append(c)
+                    if tags:
+                        anki_request(url, "addTags", notes=[note_id], tags=" ".join(tags))
+
+                    c["anki_actual_model"] = actual_model_name
+                    c["content_hash"] = new_hash
+                    c["synced"] = True
+                    stats["updated"] += 1
+                else:
+                    stats["unchanged"] += 1
+
+            kept_cards.append(c)
+
+        # Clean up any leftover untracked duplicate notes in this chapter that have 0 reviews
+        active_fronts = {html.unescape(c.get("anki_front") or "").strip() for c in kept_cards if c.get("status", "active") == "active"}
+        leftover_untracked: list[int] = []
+        for front_key, nid_list in untracked_by_front.items():
+            if front_key in active_fronts:
+                for nid in nid_list:
+                    if nid not in tracked_id_set:
+                        leftover_untracked.append(nid)
+        if leftover_untracked:
+            untracked_cards: list[int] = []
+            for nid in leftover_untracked:
+                untracked_cards.extend((existing_notes_by_id.get(nid) or {}).get("cards") or [])
+            c_infos = anki_request(url, "cardsInfo", cards=untracked_cards) if untracked_cards else []
+            reps_by_note: dict[int, int] = {}
+            for ci in c_infos or []:
+                reps_by_note[int(ci["note"])] = reps_by_note.get(int(ci["note"]), 0) + int(ci.get("reps", 0))
+            to_delete = [nid for nid in leftover_untracked if reps_by_note.get(nid, 0) == 0]
+            if to_delete:
+                anki_request(url, "deleteNotes", notes=to_delete)
+                stats["deduped_untracked"] += len(to_delete)
+    finally:
+        # Always persist ledger progress even if interrupted mid-sync
+        if len(kept_cards) == len(cards):
+            ledger["cards"] = kept_cards
+        ledger["last_synced"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        ledger_path.write_text(json.dumps(ledger, indent=2, ensure_ascii=False), encoding="utf-8")
 
     deck_root = cfg.get("anki_deck_root", "Textbooks")
     preset_info = propagate_parent_deck_config(url, deck_root, deck_prefix, synced_subdecks)
-
-    ledger["cards"] = kept_cards
-    ledger["last_synced"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    ledger_path.write_text(json.dumps(ledger, indent=2, ensure_ascii=False), encoding="utf-8")
 
     return {
         "anki_connected": True,
