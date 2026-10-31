@@ -31,15 +31,25 @@ Use this skill whenever the user says **"flashcards"**, **"generate cards"**, **
    - Exhaustive coverage means **more atomic cards**, never bloated multi-paragraph cards.
    - Each card must test **one clear concept, equation, condition, or diagram relationship**.
    - **Single Cloze Group Rule (`{{c1::...}}` only)**: Every `Cloze` card must use `{{c1::...}}` (never `{{c2::...}}` or `{{c3::...}}`), so 1 JSON entry = 1 atomic Anki review card. If an equation has two distinct parts worth testing separately, create two distinct `Cloze` cards with different `{{c1::...}}` targets.
-4. **Non-Destructive Anki Sync**:
-   - When refreshing or editing existing cards, preserve the `id` (`ch01_s1_3_c02`) of any card whose core concept is being refined so `book_tool.py` updates it in-place via `updateNoteFields` without resetting Anki review intervals.
+4. **Deterministic Chronological Reading Order**:
+   - **Linear Narrative Traversal**: Extract cards strictly in the **top-to-bottom reading order** of each page, progressing from page $N$ to page $N+1$. Do **NOT** group cards by pillar—emit cards in the exact sequence concepts, equations, and diagrams appear in the textbook so the user can verify them side-by-side in real time while reading.
+   - **Atomic Once Rule**: If a symbol, definition, or notation was already carded on an earlier page of the section, do **not** repeat it on later pages unless a new mathematical constraint, boundary condition, or physical nuance is introduced.
+   - **Two-Pass Sweep per Section**:
+     - *Pass 1 (Chronological Ground Sweep)*: Traverse pages paragraph-by-paragraph, extracting atomic definitions, equations, assumptions, and diagrams as they appear in local context.
+     - *Pass 2 (Milestone Synthesis Sweep)*: Attach any high-level cross-page intuition or summary cards to the concluding milestone page where the concept culminates.
+   - **Ordering Metadata**: Every card object MUST specify:
+     - `"source_page": <int>` (the actual PDF page number, e.g. 89)
+     - `"seq": <int>` (1, 2, 3... within that section)
+     - `"book_order": "<CC>.<SS>.<PPP>.<NN>"` (e.g. `"04.01.089.01"`, zero-padded for lexicographic sorting)
+5. **Non-Destructive Anki Sync**:
+   - When refreshing or editing existing cards, preserve the `id` (`ch04_s01_p089_c01`) of any card whose core concept is being refined so `book_tool.py` updates it in-place via `updateNoteFields` without resetting Anki review intervals.
    - Cards omitted during a refresh are never deleted—`book_tool.py` tags them `book_synthesizer::orphaned` and suspends them in Anki.
 
 ---
 
 ## The 5-Pillar Extraction Taxonomy (Mandatory Sweep)
 
-As you read each 300-DPI textbook page (`pdf_page_XXXX.png`) of section `X.Y`, systematically sweep the text, equations, examples, and figures across all **5 Pillars** so no textbook notion is left behind, while avoiding trivial linguistic filler:
+As you read each 300-DPI textbook page (`pdf_page_XXXX.png`) of section `X.Y`, systematically sweep the text, equations, examples, and figures across all **5 Pillars** as you encounter them linearly down the page, while avoiding trivial linguistic filler:
 
 1. **Pillar 1 — Formal Definitions & Nomenclature (`Basic` or `Cloze`)**:
    - Every newly introduced term, signal class, operator, property, or notation convention.
@@ -83,7 +93,7 @@ For 3+ sections, launch parallel subagents via `invoke_subagent` (`TypeName: "se
 
 Each `SectionFlashcardExtractor` subagent MUST:
 1. Call `read_file` on **every** 300-DPI page image in `page_pngs` for section `X.Y`.
-2. Perform a complete page-by-page sweep across the **5-Pillar Extraction Taxonomy**.
+2. Perform the two-pass linear chronological sweep across the **5-Pillar Extraction Taxonomy**.
 3. Write the section flashcard scratch file to `cards_scratch_path` (`.cache/<book_slug>/ch_<XX>/cards_<X>_<Y>.json`) using this schema:
 
 ```json
@@ -92,7 +102,10 @@ Each `SectionFlashcardExtractor` subagent MUST:
   "section_title": "<Clean Section Title>",
   "cards": [
     {
-      "id": "ch0<X>_s<X>_<Y>_c01",
+      "id": "ch0<X>_s0<Y>_p089_c01",
+      "book_order": "0<X>.0<Y>.089.01",
+      "source_page": 89,
+      "seq": 1,
       "model": "Basic",
       "pillar": "intuition",
       "front": "What is the physical and mathematical role of $e(t)$ in the ARX model structure?",
@@ -101,7 +114,10 @@ Each `SectionFlashcardExtractor` subagent MUST:
       "media": []
     },
     {
-      "id": "ch0<X>_s<X>_<Y>_c02",
+      "id": "ch0<X>_s0<Y>_p089_c02",
+      "book_order": "0<X>.0<Y>.089.02",
+      "source_page": 89,
+      "seq": 2,
       "model": "Cloze",
       "pillar": "equations",
       "front": "In linear regression $\\hat{y}(t|\\theta) = \\varphi^T(t)\\theta$, the least-squares estimate minimizing $V_N(\\theta)$ is given by {{c1::$\\hat{\\theta}_N = \\left[\\sum_{t=1}^N \\varphi(t)\\varphi^T(t)\\right]^{-1} \\sum_{t=1}^N \\varphi(t)y(t)$}}.",

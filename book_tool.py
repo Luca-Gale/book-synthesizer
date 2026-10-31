@@ -43,6 +43,8 @@ def load_config(workspace_root: Path) -> dict[str, Any]:
         "anki_deck_root": "Textbooks",
         "anki_basic_model": "Basic",
         "anki_cloze_model": "Cloze",
+        "anki_textbook_basic_model": "Textbook-Basic",
+        "anki_textbook_cloze_model": "Textbook-Cloze",
         "render_dpi": 300,
         "crop_padding_pct": 0.05,
         "skip_section_keywords": [
@@ -62,6 +64,11 @@ def load_config(workspace_root: Path) -> dict[str, Any]:
         loaded = json.loads(config_path.read_text(encoding="utf-8"))
         default_cfg.update(loaded)
     return default_cfg
+
+
+def should_use_textbook_models(cfg: dict[str, Any], ch_num: str | int = 1) -> bool:
+    """Determine whether to enforce isolated Textbook-* models and chronological Book_Order (applies to all chapters)."""
+    return bool(cfg.get("use_textbook_models", True))
 
 
 def sanitize_filename(name: str) -> str:
@@ -351,10 +358,103 @@ def check_anki_connection(url: str) -> bool:
         return False
 
 
-def resolve_anki_models(url: str, cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def ensure_textbook_models(
+    url: str, cfg: dict[str, Any], base_models: dict[str, dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """
+    Ensure 'Textbook-Basic' and 'Textbook-Cloze' exist in Anki with an extra 'Book_Order' field.
+    Clones styling and field conventions from the user's base models so personal templates are untouched.
+    """
+    model_names: list[str] = anki_request(url, "modelNames") or []
+    target_basic = cfg.get("anki_textbook_basic_model", "Textbook-Basic")
+    target_cloze = cfg.get("anki_textbook_cloze_model", "Textbook-Cloze")
+    target_specs = [
+        ("Basic", target_basic, False),
+        ("Cloze", target_cloze, True),
+    ]
+
+    result: dict[str, dict[str, Any]] = {}
+
+    for logical_name, target_name, is_cloze in target_specs:
+        base_info = base_models.get(logical_name) or base_models["Basic"]
+        base_model_name = base_info["model_name"]
+        front_field = base_info["front_field"]
+        back_field = base_info["back_field"]
+
+        if target_name not in model_names:
+            css = ""
+            try:
+                styling = anki_request(url, "modelStyling", modelName=base_model_name)
+                css = styling.get("css", "") if styling else ""
+            except Exception:
+                pass
+
+            fields = [front_field, back_field, "Book_Order"]
+
+            if is_cloze:
+                card_templates = [
+                    {
+                        "Name": "Cloze",
+                        "Front": f"{{{{cloze:{front_field}}}}}",
+                        "Back": f"{{{{cloze:{front_field}}}}}<br>\n{{{{{back_field}}}}}",
+                    }
+                ]
+                anki_request(
+                    url,
+                    "createModel",
+                    modelName=target_name,
+                    inOrderFields=fields,
+                    cardTemplates=card_templates,
+                    css=css,
+                    isCloze=True,
+                )
+            else:
+                card_templates = [
+                    {
+                        "Name": "Card 1",
+                        "Front": f"{{{{{front_field}}}}}",
+                        "Back": f"{{{{FrontSide}}}}<hr id=\"answer\">{{{{{back_field}}}}}",
+                    }
+                ]
+                anki_request(
+                    url,
+                    "createModel",
+                    modelName=target_name,
+                    inOrderFields=fields,
+                    cardTemplates=card_templates,
+                    css=css,
+                )
+
+        fields = anki_request(url, "modelFieldNames", modelName=target_name) or []
+        if "Book_Order" not in fields:
+            try:
+                anki_request(url, "modelFieldAdd", modelName=target_name, fieldName="Book_Order")
+                fields.append("Book_Order")
+            except Exception:
+                pass
+
+        f_field = fields[0] if len(fields) > 0 else front_field
+        b_field = fields[1] if len(fields) > 1 else back_field
+        ord_field = "Book_Order" if "Book_Order" in fields else (fields[2] if len(fields) > 2 else None)
+
+        result[logical_name] = {
+            "model_name": target_name,
+            "front_field": f_field,
+            "back_field": b_field,
+            "order_field": ord_field,
+            "all_fields": fields,
+        }
+
+    return result
+
+
+def resolve_anki_models(
+    url: str, cfg: dict[str, Any], ch_num: str | int = 1
+) -> dict[str, dict[str, Any]]:
     """
     Query AnkiConnect for available note types and their exact field names.
     Handles English ('Basic', 'Cloze') and localized Anki installs (e.g. Italian 'Basilare', 'Base', 'Omissione').
+    For chapters configured with chronological ordering (default ch >= 4), resolves to isolated Textbook-* models.
     """
     model_names: list[str] = anki_request(url, "modelNames") or []
     pref_basic = cfg.get("anki_basic_model", "Basic")
@@ -406,8 +506,13 @@ def resolve_anki_models(url: str, cfg: dict[str, Any]) -> dict[str, dict[str, An
             "model_name": actual_name,
             "front_field": fields[0],
             "back_field": fields[1],
+            "order_field": None,
             "all_fields": fields,
         }
+
+    if should_use_textbook_models(cfg, ch_num):
+        return ensure_textbook_models(url, cfg, result)
+
     return result
 
 
@@ -633,7 +738,12 @@ def convert_markdown_and_math_to_anki(
 
 
 def compute_card_hash(
-    subdeck: str, model_type: str, anki_front: str, anki_back: str, tags: list[str]
+    subdeck: str,
+    model_type: str,
+    anki_front: str,
+    anki_back: str,
+    tags: list[str],
+    book_order: str = "",
 ) -> str:
     payload = json.dumps(
         {
@@ -642,6 +752,7 @@ def compute_card_hash(
             "front": anki_front,
             "back": anki_back,
             "tags": sorted(set(tags)),
+            "book_order": book_order,
         },
         sort_keys=True,
         ensure_ascii=False,
@@ -649,11 +760,17 @@ def compute_card_hash(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+def strip_cloze_wrappers(text: str) -> str:
+    """Unwrap any balanced `{{c1::...}}` cloze syntax in a Back field where clozes are not evaluated by Anki."""
+    if not text or not re.search(r"\{\{c\d+::", text):
+        return text
+    segments = _split_math_by_balanced_clozes(text)
+    return "".join(seg for _, seg in segments)
+
+
 def normalize_model_type(raw_model: str, front_text: str) -> str:
-    """Detect whether a card is Basic or Cloze."""
+    """Detect whether a card is Basic or Cloze. Anki Cloze notes MUST contain {{c1::...}} in the front field."""
     if re.search(r"\{\{c\d+::", front_text):
-        return "Cloze"
-    if raw_model and "cloze" in raw_model.lower():
         return "Cloze"
     return "Basic"
 
@@ -782,11 +899,34 @@ def aggregate_chapter_cards(
         merged_for_sec: list[dict[str, Any]] = []
 
         raw_cards_list = sdata.get("cards", [])
+        use_textbook_ordering = should_use_textbook_models(cfg, ch_num)
         for idx, rc in enumerate(raw_cards_list, start=1):
-            default_id = f"ch{int(ch_num):02d}_s{sec_num.replace('.', '_')}_c{idx:02d}"
+            src_page = rc.get("source_page")
+            seq_val = rc.get("seq") or idx
+
+            if use_textbook_ordering:
+                if rc.get("book_order"):
+                    book_order_str = str(rc["book_order"]).strip()
+                else:
+                    sec_sub = 1
+                    try:
+                        m_sub = re.search(r"\.(\d+)", sec_num)
+                        if m_sub:
+                            sec_sub = int(m_sub.group(1))
+                    except Exception:
+                        pass
+                    page_val = int(src_page) if src_page is not None and str(src_page).isdigit() else 0
+                    book_order_str = f"{int(ch_num):02d}.{sec_sub:02d}.{page_val:03d}.{int(seq_val):02d}"
+
+                page_tag = int(src_page) if src_page is not None and str(src_page).isdigit() else 0
+                default_id = f"ch{int(ch_num):02d}_s{sec_num.replace('.', '_')}_p{page_tag:03d}_c{int(seq_val):02d}"
+            else:
+                book_order_str = str(rc["book_order"]).strip() if rc.get("book_order") else ""
+                default_id = f"ch{int(ch_num):02d}_s{sec_num.replace('.', '_')}_c{idx:02d}"
+
             cid = rc.get("id") or default_id
             raw_front = (rc.get("raw_front") or rc.get("front") or "").strip()
-            raw_back = (rc.get("raw_back") or rc.get("back") or "").strip()
+            raw_back = strip_cloze_wrappers((rc.get("raw_back") or rc.get("back") or "").strip())
             if not raw_front:
                 continue
 
@@ -795,7 +935,8 @@ def aggregate_chapter_cards(
                 candidate = old_by_front[raw_front.lower()]
                 if candidate.get("id") not in matched_old_ids:
                     matched_old = candidate
-                    cid = candidate.get("id", cid)
+                    if not rc.get("id") and not use_textbook_ordering:
+                        cid = candidate.get("id", cid)
 
             if matched_old and matched_old.get("id"):
                 matched_old_ids.add(matched_old["id"])
@@ -826,6 +967,9 @@ def aggregate_chapter_cards(
                 "id": cid,
                 "section": sec_num,
                 "subdeck": subdeck_name,
+                "source_page": src_page,
+                "seq": seq_val,
+                "book_order": book_order_str if book_order_str else None,
                 "model_name": model_type,
                 "raw_front": raw_front,
                 "raw_back": raw_back,
@@ -850,6 +994,16 @@ def aggregate_chapter_cards(
                     if not was_already_orphaned:
                         old_c["synced"] = False
                     merged_for_sec.append(old_c)
+
+        if use_textbook_ordering:
+            merged_for_sec.sort(
+                key=lambda c: (
+                    c.get("book_order") or "99.99.999.99",
+                    c.get("source_page") or 9999,
+                    c.get("seq") or 999,
+                    c.get("id") or "",
+                )
+            )
 
         new_section_cards[sec_num] = merged_for_sec
 
@@ -959,6 +1113,7 @@ def sync_chapter_to_anki(
                 c.get("anki_front", ""),
                 c.get("anki_back", ""),
                 c.get("tags", []),
+                book_order=c.get("book_order") or "",
             )
             if c.get("content_hash") != new_h or c.get("anki_note_id") is None:
                 c["synced"] = False
@@ -977,7 +1132,7 @@ def sync_chapter_to_anki(
             ),
         }
 
-    models_map = resolve_anki_models(url, cfg)
+    models_map = resolve_anki_models(url, cfg, ch_num=ch_num)
 
     # 1. Upload referenced media assets to Anki's collection.media
     uploaded_media: list[str] = []
@@ -1107,18 +1262,24 @@ def sync_chapter_to_anki(
             actual_model_name = model_spec["model_name"]
             front_field = model_spec["front_field"]
             back_field = model_spec["back_field"]
+            order_field = model_spec.get("order_field")
 
             tags = [t for t in c.get("tags", []) if t != ORPHAN_TAG]
             c["tags"] = tags
-            new_hash = compute_card_hash(subdeck, logical_model, anki_front, anki_back, tags)
+            new_hash = compute_card_hash(
+                subdeck, logical_model, anki_front, anki_back, tags, book_order=c.get("book_order") or ""
+            )
 
             # Check if note model changed
             if existing_info is not None and existing_info.get("modelName") != actual_model_name:
-                old_card_ids = existing_info.get("cards", [])
-                if old_card_ids:
-                    anki_request(url, "suspend", cards=old_card_ids)
-                anki_request(url, "addTags", notes=[note_id], tags=ORPHAN_TAG)
-                c.setdefault("previous_note_ids", []).append(note_id)
+                if prune:
+                    anki_request(url, "deleteNotes", notes=[note_id])
+                else:
+                    old_card_ids = existing_info.get("cards", [])
+                    if old_card_ids:
+                        anki_request(url, "suspend", cards=old_card_ids)
+                    anki_request(url, "addTags", notes=[note_id], tags=ORPHAN_TAG)
+                    c.setdefault("previous_note_ids", []).append(note_id)
                 existing_info = None
                 note_id = None
                 stats["model_migrations"] += 1
@@ -1138,14 +1299,18 @@ def sync_chapter_to_anki(
                     if extra_cards:
                         anki_request(url, "suspend", cards=extra_cards)
 
+            note_fields = {
+                front_field: anki_front,
+                back_field: anki_back,
+            }
+            if order_field and c.get("book_order"):
+                note_fields[order_field] = str(c["book_order"])
+
             if existing_info is None:
                 note_payload = {
                     "deckName": full_deck_name,
                     "modelName": actual_model_name,
-                    "fields": {
-                        front_field: anki_front,
-                        back_field: anki_back,
-                    },
+                    "fields": note_fields,
                     "options": {
                         "allowDuplicate": True,
                     },
@@ -1160,15 +1325,19 @@ def sync_chapter_to_anki(
                 stats["added"] += 1
             else:
                 if c.get("content_hash") != new_hash or not c.get("synced", False) or force:
+                    update_fields = {
+                        front_field: anki_front,
+                        back_field: anki_back,
+                    }
+                    if order_field and c.get("book_order"):
+                        update_fields[order_field] = str(c["book_order"])
+
                     anki_request(
                         url,
                         "updateNoteFields",
                         note={
                             "id": note_id,
-                            "fields": {
-                                front_field: anki_front,
-                                back_field: anki_back,
-                            },
+                            "fields": update_fields,
                         },
                     )
                     card_ids = existing_info.get("cards", [])
@@ -1877,6 +2046,8 @@ def cmd_refresh_cards(workspace_root: Path, cfg: dict[str, Any], args: argparse.
         sec_existing_cards = [
             {
                 "id": c.get("id"),
+                "source_page": c.get("source_page"),
+                "book_order": c.get("book_order"),
                 "model_name": c.get("model_name"),
                 "raw_front": c.get("raw_front") or c.get("front"),
                 "raw_back": c.get("raw_back") or c.get("back"),

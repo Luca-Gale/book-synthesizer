@@ -1,158 +1,124 @@
-# Technical Specification: Decoupled Book-Synthesizer & Exhaustive Flashcard Engine
+# Technical Specification: Deterministic Chronological Flashcards for Reading-Time Verification
 
 - **Status**: `FINAL — Red-Team Validated`
-- **Last Updated**: 2026-10-22
-- **Companion Audit Log**: [RED_TEAM_AUDIT.md](./RED_TEAM_AUDIT.md)
+- **Last Updated**: 2026-10-30
+- **Scope**: Applied to Chapters 04, 05, and subsequent chapters. Prior chapters (1–3) remain untouched unless explicitly refreshed.
 
 ---
 
 ## 1. Overview & Core Problem
-
-- **Core Problem Statement**: Studying dense engineering and mathematics textbooks follows a three-stage cognitive lifecycle:
-  1. **Priming (Obsidian Notes)**: Building geometric, physical, and structural intuition before tackling the chapter.
-  2. **Deep Diving (The Textbook)**: Reading the unabridged textbook prose, derivations, and diagrams.
-  3. **Long-Term Retention (Anki Flashcards)**: Retaining all concepts over months and years exclusively through spaced repetition reviews—without returning to the textbook.
-
-  Previously, a single monolithic skill/subagent attempted to write the Obsidian primer note and extract Anki flashcards in the same pass. This created two structural problems:
-  - **Lossy Summary Cascade & Attention Split**: Generating both in a single pass risked turning flashcards into a summary of a summary or suffering token-budget exhaustion at the end of long derivations.
-  - **Coupled Prompt Tuning**: Fine-tuning flashcard pedagogy (e.g., Cloze density, atomic rules, question style) required modifying the monolithic skill and risked regressing note synthesis, and vice versa.
-
-- **Architectural Solution**: **Pipelined Dual-Agent Decoupling with Direct-from-Source Extraction**
-  1. **Agent 1 — `SectionNoteSynthesizer` ([`.agent/skills/synthesize/SKILL.md`](./.agent/skills/synthesize/SKILL.md))**:
-     - Reads the 300-DPI textbook page PNGs for section $X.Y$.
-     - Crops all textbook figures, block diagrams, and plots into `vault/.../assets/fig_<X>_<Y>_<slug>.png` via `book_tool.py crop` (which logs them in `.cache/.../assets_manifest.json`).
-     - Writes a distraction-free Obsidian Pre-Reading Primer Note (`X.Y <Title>.md`). Never generates flashcards.
-  2. **Agent 2 — `SectionFlashcardExtractor` ([`.agent/skills/flashcards/SKILL.md`](./.agent/skills/flashcards/SKILL.md))**:
-     - Runs as an independent, isolated agent stage with its own dedicated skill file so its prompt can be tuned freely without affecting note synthesis.
-     - **Reads the raw 300-DPI textbook page PNGs directly** (never summarizing the primer note) so zero textbook notions are lost.
-     - Consumes the already-cropped figures from `assets_manifest.json` (and can call `book_tool.py crop` as a fallback if it spots an uncropped figure worth testing).
-     - Enforces the **5-Pillar Extraction Taxonomy** and the **Minimum Information Principle** to achieve 100% conceptual coverage without trivial semantic bloat.
-
-- **Target Surface**: Local Windows environment running inside Antigravity, combining [`book_tool.py`](./book_tool.py) (deterministic PDF/Vault/Anki CLI helper), Obsidian (`vault/`), and desktop Anki via AnkiConnect (`http://127.0.0.1:8765`).
-
-- **Non-Goals**:
-  - Generating flashcards by summarizing the Obsidian note (cards must always read the raw 300-DPI textbook pages).
-  - Hard-deleting cards on re-runs (orphaned cards are tagged `book_synthesizer::orphaned` and auto-suspended in Anki to preserve spaced repetition history).
-  - External paid LLM API keys or cloud services.
+- **Problem Statement**: During first-time reading of a textbook chapter, the user keeps Anki in sight as a real-time safety check on AI-generated flashcards before studying them with spaced repetition. Cards must follow the exact chronological progression of the textbook (page-by-page, derivation step-by-step) so the user can audit them in Anki's Browser/Preview without friction.
+- **Target User / Execution Surface**: Solo student/engineer using Anki Desktop (Card Browser / Preview mode) side-by-side with a textbook PDF viewer on Windows. Synchronized via local AnkiConnect (`127.0.0.1:8765`).
+- **Validated Architectural Core**:
+  - **Zero Scheduler Hacking**: Never touch Anki's `due` integers, review queues, or deck options presets. Cards remain purely scheduled by Anki's SRS (FSRS/SM-2) once studied.
+  - **Dedicated Note Types (`Textbook-Basic` / `Textbook-Cloze`)**: Independent clones of standard note types with an extra, non-rendered `Book_Order` field (`<chapter>.<section>.<page>.<seq>`, e.g., `04.01.089.02`). This unlocks 1-click deterministic sorting in Anki Browser without touching cards or templates in other decks.
+  - **Narrative Traversal with 5-Pillar Lens**: The extraction agent sweeps each section page chronologically from top to bottom (preserving local context, derivations, and assumptions) while maintaining exhaustive 5-pillar coverage and the "Atomic Once" rule.
 
 ---
 
 ## 2. Core User Flows (The Happy Path)
 
-### Flow 1 — Full End-to-End Chapter Synthesis (`/synthesize`)
-1. **Prepare**: `python book_tool.py prepare` slices the target chapter from `./chapter.txt` and `./book/*.pdf`, renders 300-DPI page PNGs, and outputs `manifest.json`.
-2. **Stage A — Note Synthesis (`SectionNoteSynthesizer`)**:
-   - Parallel section subagents read `pdf_page_XXXX.png` for each section $X.Y$, crop figures via `python book_tool.py crop` (populating `assets_manifest.json`), and write `vault/<Book>/Chapter XX/X.Y <Title>.md`.
-3. **Stage B — Exhaustive Flashcard Extraction (`SectionFlashcardExtractor`)**:
-   - Parallel flashcard subagents (following `.agent/skills/flashcards/SKILL.md`) read the raw `pdf_page_XXXX.png` images for section $X.Y$ alongside the cropped `section_assets` list, and extract exhaustive atomic cards across the 5-Pillar Taxonomy into `.cache/<book_slug>/ch_<XX>/cards_<X>_<Y>.json`.
-4. **Finalize & Sync**:
-   - Single-threaded `python book_tool.py finalize` sanitizes MathJax, injects `[[Prev]] | [[MOC]] | [[Next]]` links, builds `00 - Chapter XX MOC.md`, aggregates all section cards into `decks/<book_slug>/ch_<XX>_cards.json`, and syncs non-destructively to Anki via AnkiConnect.
+### Flow 1: Chronological 5-Pillar Extraction (`flashcards/SKILL.md`)
+1. `python book_tool.py prepare` renders 300-DPI page PNGs for the active chapter (e.g. Chapter 04).
+2. For each section, the `SectionFlashcardExtractor` subagent performs:
+   - **Pass 1 (Chronological Ground Sweep)**: Scans pages top-to-bottom in narrative sequence, extracting atomic definitions, equations, assumptions, and diagrams across the 5 Pillars right as they appear.
+   - **Pass 2 (Synthesis Sweep)**: Attaches any high-level cross-page intuition or summary cards to the concluding milestone page.
+3. Every card is assigned:
+   - `id`: `ch04_s01_p089_c01`
+   - `source_page`: `89`
+   - `book_order`: `04.01.089.01`
+   - Stored in `.cache/<book_slug>/ch_04/cards_4_1.json`.
 
-### Flow 2 — Standalone Flashcard Generation, Refresh, or Prompt Tuning (`/flashcards`)
-1. User edits `.agent/skills/flashcards/SKILL.md` (or gives custom instructions in chat) and triggers `/flashcards` (or asks to refresh/regenerate cards for a chapter or section).
-2. `python book_tool.py refresh-cards [--chapter X] [--section X.Y]` inspects the chapter manifest, returns the exact 300-DPI `page_pngs`, `section_assets`, and `existing_cards` ledger for each section.
-3. `SectionFlashcardExtractor` reads the raw 300-DPI textbook page PNGs directly, preserves card `id`s when refining existing concepts, crops any missing diagram if needed via `book_tool.py crop`, and writes `.cache/<book_slug>/ch_<XX>/cards_<X>_<Y>.json`.
-4. `python book_tool.py sync-anki [--chapter X] [--section X.Y]` updates Anki in-place via `updateNoteFields` and suspends retired cards—without ever touching the Obsidian `.md` notes.
+### Flow 2: Note Type Resolution & Non-Destructive Anki Sync (`book_tool.py`)
+1. `book_tool.py sync-anki` verifies if `Textbook-Basic` and `Textbook-Cloze` exist in Anki via AnkiConnect:
+   - If missing, it auto-clones them from `Basic` and `Cloze`, adding the `Book_Order` field.
+   - Standard `Basic` and `Cloze` note types used by other decks remain completely untouched.
+2. In chapters configured for the new method (Chapters 4+), cards are assigned the `Textbook-*` models with `fields: {"Front": ..., "Back": ..., "Book_Order": "04.01.089.01"}` (or `Text`, `Back Extra`, `Book_Order`).
+3. Existing cards are updated in-place via `updateNoteFields` without resetting intervals; new cards are added via `addNote`.
 
-### Flow 3 — Standalone Note Synthesis Tuning (`/synthesize notes-only`)
-1. User tunes `.agent/skills/synthesize/SKILL.md` and asks to regenerate or polish the Obsidian primer notes without touching Anki flashcards.
-2. `SectionNoteSynthesizer` updates `vault/<Book>/Chapter XX/X.Y <Title>.md`.
-3. `python book_tool.py finalize --notes-only` sanitizes MathJax and updates the MOC and navigation headers while skipping Anki aggregation and synchronization.
+### Flow 3: Side-by-Side Reading Audit
+1. The user opens the textbook PDF on one monitor and Anki's **Card Browser** on the other.
+2. In Anki Browser, the user selects the target deck (e.g., `Textbooks::<Book>::Chapter 04` or subdeck `4.1`) and sorts by the `Book_Order` column.
+3. The cards display in 100% perfect lockstep with the textbook text. As the user reads, they tap down-arrow to verify each card. If a card needs an edit or suspension, the user does it in Anki instantly.
 
 ---
 
 ## 3. System Architecture & Components
 
-```mermaid
-flowchart TD
-    subgraph Prep ["1. Deterministic Slicing (book_tool.py prepare)"]
-        PDF["book/*.pdf + chapter.txt"]
-        Manifest[".cache/<book>/ch_XX/manifest.json"]
-        Pages[".cache/<book>/ch_XX/pages/pdf_page_XXXX.png (300 DPI)"]
-    end
-
-    subgraph StageA ["2. Stage A: SectionNoteSynthesizer (.agent/skills/synthesize)"]
-        NoteWorker["Note Subagent (Sec X.Y)"]
-        CropTool["book_tool.py crop"]
-        AssetManifest[".cache/<book>/ch_XX/assets_manifest.json"]
-        VaultAssets["vault/.../assets/fig_X_Y_*.png"]
-        VaultNotes["vault/.../X.Y <Title>.md"]
-    end
-
-    subgraph StageB ["3. Stage B: SectionFlashcardExtractor (.agent/skills/flashcards)"]
-        CardWorker["Flashcard Subagent (Sec X.Y)"]
-        ScratchCards[".cache/<book>/ch_XX/cards_X_Y.json"]
-    end
-
-    subgraph Sync ["4. Finalization & Anki Sync (book_tool.py)"]
-        FinNotes["finalize (--notes-only optional)"]
-        SyncAnki["sync-anki / finalize"]
-        DeckLedger["decks/<book>/ch_XX_cards.json"]
-        AnkiConnect["Anki Desktop (127.0.0.1:8765)"]
-    end
-
-    PDF --> Manifest
-    PDF --> Pages
-
-    Pages --> NoteWorker
-    NoteWorker --> CropTool
-    CropTool --> VaultAssets
-    CropTool --> AssetManifest
-    NoteWorker --> VaultNotes
-
-    Pages -->|"Direct Raw Page Read (No Summary Loss)"| CardWorker
-    AssetManifest -->|"Shared Cropped Figures"| CardWorker
-    CardWorker -.->|"Fallback Crop if Needed"| CropTool
-    CardWorker --> ScratchCards
-
-    VaultNotes --> FinNotes
-    ScratchCards --> SyncAnki
-    SyncAnki --> DeckLedger
-    SyncAnki --> AnkiConnect
 ```
-
-### The 5-Pillar Flashcard Extraction Taxonomy
-To satisfy the user's requirement that **nothing in the textbook feels new after studying the deck** while preventing trivial filler cards, `SectionFlashcardExtractor` systematically sweeps every paragraph, equation, and figure across 5 mandatory pillars:
-1. **Pillar 1 — Formal Definitions & Nomenclature**: Exact definitions of every system property, signal class, operator, and symbol introduced in the text.
-2. **Pillar 2 — Governing Equations, Derivations & Structure (`Cloze`)**: Every numbered and unnumbered equation, matrix structure, regressor vector, and key algebraic transition step, using atomic `{{c1::...}}` clozes.
-3. **Pillar 3 — Explicit & Implicit Assumptions / Boundary Conditions**: When does a formula hold? What noise, linearity, stationarity, or invertibility (e.g., persistency of excitation) conditions are required? What breaks if violated?
-4. **Pillar 4 — Physical, Geometric & Engineering Intuition (`Basic`)**: Why is the model structured this way? What is the physical meaning of each term or parameter in real-world engineering systems?
-5. **Pillar 5 — Visual Diagram & Plot Interpretation (`Basic` / `Cloze` with Media)**: Signal flows, block diagrams, experimental plots, and geometric interpretations, embedding cropped `![[assets/fig_X_Y_<slug>.png]]` directly on the card.
+┌─────────────────────────────────────────────────────────────┐
+│                 Textbook PDF Page Images                    │
+│                 (300 DPI, Pages 89-94)                      │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│          SectionFlashcardExtractor Subagent                 │
+│  - Traversal: Chronological Top-to-Bottom                   │
+│  - Lens: 5-Pillar Taxonomy (Definitions, Equations, ...)    │
+│  - Guardrails: "Atomic Once" rule + 2-Pass Synthesis        │
+│  - Output: cards_4_1.json with `book_order: 04.01.089.01`   │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│                 book_tool.py Aggregator                     │
+│  - Aggregates by section & book_order                       │
+│  - Ensures `Textbook-Basic` & `Textbook-Cloze` exist in Anki │
+│  - Maps fields: Front, Back, Book_Order                     │
+│  - Syncs via AnkiConnect (addNote / updateNoteFields)        │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│                  Anki Desktop Collection                    │
+│  - Isolated Note Types: Textbook-Basic & Textbook-Cloze     │
+│  - Other decks untouched                                    │
+│  - Card Browser: 1-click sort by `Book_Order` column        │
+│  - Review Mode: Pure SRS (intervals uncompromised)          │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## 4. Data Model & State Lifecycle
+## 4. Data Model & Note Type Blueprint
 
-### Shared Asset Manifest (`.cache/<book_slug>/ch_<XX>/assets_manifest.json`)
-Written automatically by `python book_tool.py crop`:
+### Anki Models
+
+#### `Textbook-Basic` (Cloned from `Basic`)
+- **Fields**:
+  1. `Front` (Card question)
+  2. `Back` (Card answer & explanations)
+  3. `Book_Order` (Zero-rendered sequence string: `CC.SS.PPP.NN`)
+- **Templates**:
+  - Front: `{{Front}}`
+  - Back: `{{FrontSide}}<hr id="answer">{{Back}}` *(Note: `{{Book_Order}}` is excluded from templates so it never displays during review mode)*.
+
+#### `Textbook-Cloze` (Cloned from `Cloze`)
+- **Fields**:
+  1. `Text` (Cloze prompt with `{{c1::...}}`)
+  2. `Back Extra` (Derivation intuition / media)
+  3. `Book_Order` (Zero-rendered sequence string: `CC.SS.PPP.NN`)
+- **Templates**:
+  - Front: `{{cloze:Text}}`
+  - Back: `{{cloze:Text}}<br>{{Back Extra}}`
+
+### JSON Scratch Card Schema (`cards_X_Y.json`)
 ```json
 {
-  "assets": [
-    {
-      "filename": "fig_1_3_arx_block.png",
-      "section": "1.3",
-      "obsidian_embed": "![[assets/fig_1_3_arx_block.png]]",
-      "source_pdf_page": 31,
-      "bbox": "180,140,420,860",
-      "cropped_image_path": "C:/.../vault/.../assets/fig_1_3_arx_block.png"
-    }
-  ]
-}
-```
-
-### Section Flashcards Scratch File (`.cache/<book_slug>/ch_<XX>/cards_<X>_<Y>.json`)
-```json
-{
-  "section": "1.3",
-  "section_title": "An Archetypical Problem - ARX Models and the Linear Least Squares Method",
+  "section": "4.1",
+  "section_title": "Frequency Domain Identification",
   "cards": [
     {
-      "id": "ch01_s1_3_c01",
+      "id": "ch04_s01_p089_c01",
+      "book_order": "04.01.089.01",
+      "source_page": 89,
+      "seq": 1,
       "model": "Cloze",
       "pillar": "equations",
-      "front": "In the ARX model structure $A(q)y(t) = B(q)u(t) + e(t)$, the linear regression predictor is written as {{c1::$\\hat{y}(t|\\theta) = \\varphi^T(t)\\theta$}}.",
-      "back": "Here $\\varphi(t)$ is the regression vector of past outputs and inputs, and $\\theta$ is the parameter vector.",
-      "tags": ["arx", "linear-regression", "pillar-equations"],
+      "front": "The discrete-time Fourier transform (DTFT) of signal $s(t)$ is defined as {{c1::$\\Phi_s(\\omega) = \\sum_{\\tau=-\\infty}^{\\infty} R_s(\\tau) e^{-i\\omega \\tau}$}}.",
+      "back": "Assuming wide-sense stationary noise with autocorrelation $R_s(\\tau)$.",
+      "tags": ["dtft", "definitions", "pillar-equations"],
       "media": []
     }
   ]
@@ -161,16 +127,22 @@ Written automatically by `python book_tool.py crop`:
 
 ---
 
-## 5. Constraints, Edge Cases & Failure Modes
-
-- **Single-Cloze Group Normalization**: `book_tool.py` automatically normalizes any `{{c2::...}}`, `{{c3::...}}` into `{{c1::...}}` and hoists clozes outside `\(...\)` so 1 JSON card always produces 1 atomic Anki review card with valid DOM preview.
-- **Fallback Figure Cropping in Flashcard Stage**: If `SectionFlashcardExtractor` spots a textbook plot or schematic on `pdf_page_XXXX.png` that is not yet in `assets_manifest.json`, it runs `python book_tool.py crop` directly so visual cards never lack media.
-- **Offline Tolerance**: If Anki Desktop is closed during `finalize` or `sync-anki`, cards are staged in `decks/<book_slug>/ch_<XX>_cards.json` with `synced: false` and pushed on the next `python book_tool.py sync-anki`.
+## 5. Migration & Scope Boundary
+- **Chapter Scoping**: This new ordering and model schema is enforced strictly for **Chapter 4 and Chapter 5** (and future chapters).
+- **Backwards Compatibility**:
+  - Chapters 1, 2, and 3 are **not** migrated or touched. Their existing notes and `Basic`/`Cloze` models in Anki remain active.
+  - If the user explicitly runs `python book_tool.py refresh-cards --chapter 1` in the future, it can optionally be re-synthesized into the new format.
 
 ---
 
-## 6. Implementation Roadmap
-
-- [x] **Milestone 1**: Validate decoupled architecture via Red-Team / Blue-Team debate and user cross-examination.
-- [x] **Milestone 2**: Enhance `book_tool.py` (`crop` writes `assets_manifest.json`, `refresh-cards` exposes raw `page_pngs` + `section_assets` per section, `finalize` supports `--notes-only`).
-- [x] **Milestone 3**: Create dedicated `.agent/skills/flashcards/SKILL.md` for `SectionFlashcardExtractor` and update `.agent/skills/synthesize/SKILL.md` for `SectionNoteSynthesizer` + pipelined orchestration.
+## 6. Implementation Checklist
+- [ ] **Task 1: Extractor Prompt (`flashcards/SKILL.md`)**:
+  - Update instructions to mandate chronological top-to-bottom reading traversal per page.
+  - Add "Atomic Once" rule and Pass 1 / Pass 2 synthesis guidance.
+  - Add `book_order` (`<ch>.<sec>.<page>.<seq>`) and `source_page` to the output schema.
+- [ ] **Task 2: Model Provisioning & Field Mapping (`book_tool.py`)**:
+  - In `sync_chapter_to_anki`, check if `Textbook-Basic` and `Textbook-Cloze` exist in Anki; create them via `createModel` if absent.
+  - When processing chapters $\ge 4$, map notes to `Textbook-Basic` and `Textbook-Cloze` and populate `Book_Order`.
+  - For chapters $< 4$, retain existing behavior unless forced.
+- [ ] **Task 3: Ledger & Aggregation Updates (`book_tool.py`)**:
+  - Store and preserve `book_order` and `source_page` in `decks/<book_slug>/ch_<XX>_cards.json`.

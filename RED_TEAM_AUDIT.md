@@ -1,52 +1,58 @@
-# Red-Team Architectural Audit Log: Decoupled Book-Synthesizer & Exhaustive Flashcard Engine
+# Red-Team Architectural Audit Log: Deterministic Chronological Flashcards
 
-- **Date**: 2026-10-22
+- **Date**: 2026-10-30
 - **Companion Spec**: [TECH_SPEC.md](./TECH_SPEC.md)
 
 ---
 
 ## 1. Executive Summary
-The architecture evolved from a single monolithic `/synthesize` skill—where one section subagent wrote both the Obsidian Pre-Reading Primer note and the Anki flashcards simultaneously—into a **strictly decoupled two-agent pipeline**:
-1. **`SectionNoteSynthesizer` ([`.agent/skills/synthesize/SKILL.md`](./.agent/skills/synthesize/SKILL.md))**: Dedicated exclusively to pedagogical narrative, step-by-step mathematical derivations, symbol glossaries, and cropping textbook diagrams.
-2. **`SectionFlashcardExtractor` ([`.agent/skills/flashcards/SKILL.md`](./.agent/skills/flashcards/SKILL.md))**: Dedicated exclusively to exhaustive, atomic active-recall extraction directly from the 300-DPI textbook page PNGs, governed by a 5-Pillar Extraction Taxonomy and backed by a shared cropped-figure asset manifest.
+The user requested a workflow change: during the initial reading of a textbook chapter, they keep Anki side-by-side to perform real-time verification and sanity checks on generated flashcards before studying them with spaced repetition. They asked how difficult it would be to enforce the card order in Anki to match the book concepts perfectly.
 
-This separation allows the user to fine-tune flashcard generation rules, density, and phrasing independently without risking regressions in Obsidian note synthesis (and vice versa), while ensuring flashcards extract 100% of the source textbook's notions rather than summarizing an already-condensed note.
+The initial Blue Team draft attempted to enforce this via Anki's scheduler internals (`due` integers, deck options presets, and AnkiConnect `reposition` calls). 
+The Red Team exposed that hacking Anki's scheduler was brittle, over-engineered, and prone to breaking as soon as cards were reviewed or refreshed. 
+
+Through the debate and user cross-examination, both teams aligned on a clean, robust data architecture: **leave Anki's scheduler 100% untouched**, provision isolated **`Textbook-Basic` and `Textbook-Cloze`** note types with an unrendered `Book_Order` field (`04.01.089.02`), and adapt the extraction agent to a **narrative top-to-bottom traversal** anchored by the 5-Pillar lens. The user explicitly scoped this rollout to Chapters 4 and 5 onward, preserving earlier chapters untouched.
 
 ---
 
 ## 2. Concessions & Adopted Improvements
-Architectural changes proposed by the 🔴 Red Team that the 🔵 Blue Team accepted during Rounds 1 & 2:
 
 | Area / Component | Initial v1 Proposal (Blue) | Red Team Critique | Adopted Solution |
 | :--- | :--- | :--- | :--- |
-| **Diagram & Figure Sharing (`assets_manifest.json`)** | `SectionNoteSynthesizer` crops figures into `vault/.../assets/`, while `SectionFlashcardExtractor` runs isolated on raw PDF pages. | **The "Orphan Crop" Dilemma**: If the Flashcard Agent runs decoupled on raw pages, it either lacks access to cropped diagram filenames or duplicates cropping work with conflicting filenames. | `book_tool.py crop` automatically records every cropped figure into `.cache/<book>/ch_XX/assets_manifest.json`, and `refresh-cards` exposes `section_assets` alongside `page_pngs`. `SectionFlashcardExtractor` reuses existing crops and has fallback `crop` access if an uncropped figure is needed. |
-| **Exhaustive Extraction vs. Anki Bloat** | Unbounded prompt instruction: *"Extract literally everything from the section; over-generation is welcomed."* | **The Anki Bloat & Suspension Fatigue Trap**: Unbounded LLM extraction produces trivial semantic fluff and multi-clause cards, forcing exhausting manual suspension in Anki. | Adopted the **5-Pillar Flashcard Extraction Taxonomy** (1. Formal Definitions, 2. Governing Equations/Derivations, 3. Explicit/Implicit Assumptions, 4. Physical/Geometric Intuition, 5. Diagram Interpretation) + strict **Minimum Information Principle** (1 atomic fact per card). |
-| **Independent Note Re-Finalization (`--notes-only`)** | `book_tool.py finalize` always triggered both Obsidian MOC generation and AnkiConnect deck syncing. | Tuning the note synthesizer alone would still trigger Anki aggregation and syncing. | Added `--notes-only` flag to `book_tool.py finalize` so Obsidian notes and MOC links can be rebuilt completely independently of Anki. |
+| **Anki Queue Ordering** | Modify card `due` integers via AnkiConnect `reposition` and set deck gather order presets. | Over-engineering. In Anki, `due` is SRS scheduling state; FSRS/SM-2 overwrites it once studied, destroying the linear order in Browser. | **Zero scheduler hacking.** Cards schedule naturally. Linear order is maintained via an explicit metadata field. |
+| **Browser Sortability** | Store `source_page` and `seq` only in JSON scratch files/ledger. | Anki's Card Browser cannot sort on JSON files. It only sorts on first-class Note Fields. | Add an explicit `Book_Order` field (`CC.SS.PPP.NN`) to the note model so Anki Browser can sort by it with 1 click. |
+| **Note Type Safety** | Inject fields directly or add tags into existing standard `Basic` / `Cloze`. | Mutating global `Basic`/`Cloze` note types pollutes other decks (languages, medical, programming). | Auto-clone dedicated `Textbook-Basic` and `Textbook-Cloze` models, leaving personal decks 100% untouched. |
 
 ---
 
 ## 3. Defended Decisions
-Challenges raised by the 🔴 Red Team that were successfully defended and kept as originally designed:
 
-- **Direct-from-PDF Multimodal Reading by `SectionFlashcardExtractor`**:
-  - *Challenge*: Red Team argued that having both `SectionNoteSynthesizer` and `SectionFlashcardExtractor` read the 300-DPI page PNGs incurs a "Double Vision" token cost and could risk terminology drift compared to reading the synthesized Markdown note.
-  - *Defense*: The user's long-term study workflow relies almost exclusively on Anki flashcards after the initial chapter reading, making flashcards the #1 priority artifact. Feeding the Obsidian note as the primary source would turn flashcards into a lossy summary of a summary. Reading the 300-DPI textbook pages directly guarantees zero omitted equations, sidebars, or subtle assumptions, while verbatim textbook nomenclature prevents drift.
+- **Anki Browser as the Primary Audit Surface**: 
+  - *Challenge*: The Red Team proposed bypassing Anki entirely for reading audits by appending an Obsidian card table to the bottom of the section primer notes.
+  - *Defense*: The user's goal is real-time sanity checking where bad cards or clozes can be edited or suspended immediately. Anki Browser/Preview allows inline editing and immediate suspension. An Obsidian table would require complex bi-directional sync to push edits back to Anki.
 
 ---
 
 ## 4. Cross-Examination & User Executive Rulings
-Deadlocks that went to the **Cross-Examination Chamber** and how the user ruled:
 
-### Fork 1: Pipeline Coordination Between Note Synthesis and Flashcard Extraction
-- **🔵 Blue Team Stance (Pipelined Handoff)**: During a full `/synthesize` run, `SectionNoteSynthesizer` runs first (writing the note and cropping figures into `vault/.../assets/`), followed immediately by `SectionFlashcardExtractor` (which reads the raw PDF pages and embeds the already-cropped figures). Subsequent flashcard fine-tuning runs `SectionFlashcardExtractor` standalone via `/flashcards`.
-- **🔴 Red Team Stance (Standalone Parallel Workers)**: Decouple figure cropping into a separate daemon/pre-pass so flashcards could be generated for a new chapter before—or without ever—generating Obsidian primer notes.
-- **Key Insights from Cross-Examination**: The user pointed out that their real-world study sequence is strictly `Obsidian Priming Notes -> Textbook Deep Dive -> Long-Term Anki Reviews`. Since flashcards are never needed *before* the priming notes exist on initial synthesis, Red Team's concern about waiting for notes on initial run does not apply in practice.
-- **⚖️ Final User Ruling**: **Approach 1 (Pipelined Handoff with Shared Asset Manifest & Standalone `/flashcards` Re-Run)**. Both teams aligned on this ruling.
+### Fork 1: Global Template Mutation vs. Isolated Note Types
+- **🔵 Blue Team Stance**: Dedicated note types (`Textbook-Basic`/`Cloze`) give a clean `Book_Order` column in Anki Browser without touching standard templates, and remain invisible during reviews.
+- **🔴 Red Team Stance**: Warned against creating profile sprawl unless guaranteed that existing note types remain unaffected.
+- **Key Insights from Cross-Examination**: The user inquired if introducing new note types would preserve their existing card templates in other decks without modification. Blue confirmed that note types in Anki are completely isolated blueprints.
+- **⚖️ Final User Ruling**: Approved dedicated `Textbook-Basic` and `Textbook-Cloze` note types.
+
+### Fork 2: Impact on Extraction Quality (5 Pillars vs. Chronological)
+- **User Inquiry**: Does shifting to chronological extraction degrade card quality or abandon the 5 Pillars philosophy?
+- **Blue Team Explanation**: The 5 Pillars is a *coverage checklist*, while chronology is a *traversal strategy*. Shifting to top-to-bottom reading improves local context grounding (equations stay beside their assumptions) without sacrificing depth. Guardrails ("Atomic Once" rule + 2-pass synthesis) prevent greedy duplication.
+- **⚖️ Final User Ruling**: Approved narrative traversal with the 5-Pillar lens.
+
+### Fork 3: Chapter Rollout Scope
+- **⚖️ Final User Ruling**: Enforce this new method specifically for **Chapters 4 and 5** (and future chapters). Do not alter Chapters 1, 2, or 3.
 
 ---
 
 ## 5. Deferred Ideas & Discard Pile
-Features, abstractions, or technologies explicitly rejected during red-teaming (so future development sessions do not accidentally re-introduce them):
 
-- **Note-Only Flashcard Extraction (Summarizing the Markdown Primer)**: Rejected because it degrades flashcard completeness and violates the requirement that nothing in the textbook should feel new after studying the deck.
-- **Separate Pre-Pass Figure Detection Agent**: Rejected as premature complexity given that `SectionNoteSynthesizer` already inspects every page prior to `SectionFlashcardExtractor` during initial chapter synthesis, and `SectionFlashcardExtractor` retains fallback `book_tool.py crop` capability.
+- **AnkiConnect `reposition` queue calls**: Discarded. Using `due` integer manipulation for document pagination creates conflicts with Anki's SRS scheduling.
+- **Visible In-Card Reading Headers**: Discarded. Displaying page numbers or sequence IDs on the front of cards creates artificial retrieval clues that ruin long-term active recall during reviews.
+- **Obsidian-Only Card Audit Table**: Discarded as primary surface. Kept Anki Card Browser as the primary interactive audit surface for immediate editing/suspension.
